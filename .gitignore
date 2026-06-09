@@ -1,0 +1,43 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output
+*.out
+*.pdb
+
+# Go workspace
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config with local paths
+config.yaml
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Tools
+tools/
+
+# Logs
+*.log
+
+# Environment
+.env

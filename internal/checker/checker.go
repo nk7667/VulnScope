@@ -1,0 +1,265 @@
+package checker
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
+// CheckResult 检查结果
+type CheckResult struct {
+	Name    string // nmap / nuclei
+	Found   bool
+	Path    string
+	Version string
+	Error   string
+}
+
+// CheckNmap 检查 nmap 是否可用
+func CheckNmap(nmapPath string) CheckResult {
+	result := CheckResult{Name: "nmap"}
+
+	path, err := exec.LookPath(nmapPath)
+	if err != nil {
+		result.Error = fmt.Sprintf("nmap 未找到 (%s)，端口扫描将使用 Go 原生 TCP 扫描（功能受限）", nmapPath)
+		return result
+	}
+
+	result.Found = true
+	result.Path = path
+
+	// 获取版本
+	out, err := exec.Command(path, "--version").Output()
+	if err == nil {
+		lines := strings.Split(string(out), "\n")
+		if len(lines) > 0 {
+			result.Version = strings.TrimSpace(lines[0])
+		}
+	}
+
+	return result
+}
+
+// CheckNuclei 检查 nuclei 是否可用
+func CheckNuclei(nucleiPath string) CheckResult {
+	result := CheckResult{Name: "nuclei"}
+
+	path, err := exec.LookPath(nucleiPath)
+	if err != nil {
+		result.Error = fmt.Sprintf("nuclei 未找到 (%s)，漏洞扫描将无法执行", nucleiPath)
+		return result
+	}
+
+	result.Found = true
+	result.Path = path
+
+	// 获取版本
+	out, err := exec.Command(path, "-version").Output()
+	if err == nil {
+		result.Version = strings.TrimSpace(string(out))
+	}
+
+	return result
+}
+
+// InstallDir 获取安装目录（项目目录下的 tools）
+func InstallDir() string {
+	// 获取可执行文件所在目录
+	exePath, err := os.Executable()
+	if err != nil {
+		dir := filepath.Join(os.Getenv("USERPROFILE"), ".blackbox-scanner", "tools")
+		os.MkdirAll(dir, 0755)
+		return dir
+	}
+	dir := filepath.Join(filepath.Dir(exePath), "tools")
+	os.MkdirAll(dir, 0755)
+	return dir
+}
+
+// DownloadNuclei 下载 nuclei
+func DownloadNuclei() (string, error) {
+	installDir := InstallDir()
+	targetPath := filepath.Join(installDir, "nuclei.exe")
+
+	// 如果已存在，直接返回
+	if _, err := os.Stat(targetPath); err == nil {
+		return targetPath, nil
+	}
+
+	// 确定 GitHub release 下载 URL
+	goos := runtime.GOOS
+	arch := runtime.GOOS
+	if runtime.GOARCH == "amd64" {
+		arch = "amd64"
+	} else {
+		arch = "386"
+	}
+
+	// nuclei 最新版本 URL
+	zipName := fmt.Sprintf("nuclei_%s_%s.zip", goos, arch)
+	url := fmt.Sprintf("https://github.com/projectdiscovery/nuclei/releases/latest/download/%s", zipName)
+
+	fmt.Printf("[Checker] 正在下载 nuclei: %s\n", url)
+
+	zipPath := filepath.Join(installDir, zipName)
+	if err := downloadFile(url, zipPath); err != nil {
+		return "", fmt.Errorf("下载 nuclei 失败: %v\n请手动下载: https://github.com/projectdiscovery/nuclei/releases", err)
+	}
+
+	// 解压
+	fmt.Println("[Checker] 正在解压 nuclei...")
+	if err := exec.Command("powershell", "-Command",
+		fmt.Sprintf("Expand-Archive -Path '%s' -DestinationPath '%s' -Force", zipPath, installDir)).Run(); err != nil {
+		return "", fmt.Errorf("解压失败: %v", err)
+	}
+
+	// 清理 zip
+	os.Remove(zipPath)
+
+	// 验证
+	if _, err := os.Stat(targetPath); err != nil {
+		// 尝试在子目录中查找
+		filepath.Walk(installDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.Name() == "nuclei.exe" {
+				os.Rename(path, targetPath)
+				return filepath.SkipAll
+			}
+			return nil
+		})
+	}
+
+	if _, err := os.Stat(targetPath); err != nil {
+		return "", fmt.Errorf("nuclei 安装失败，请手动下载: https://github.com/projectdiscovery/nuclei/releases")
+	}
+
+	fmt.Printf("[Checker] nuclei 安装成功: %s\n", targetPath)
+	return targetPath, nil
+}
+
+// DownloadNmap 下载 nmap (Windows)
+func DownloadNmap() (string, error) {
+	installDir := InstallDir()
+	nmapDir := filepath.Join(installDir, "nmap")
+	targetPath := filepath.Join(nmapDir, "nmap.exe")
+
+	// 如果已存在，直接返回
+	if _, err := os.Stat(targetPath); err == nil {
+		return targetPath, nil
+	}
+
+	// nmap Windows 安装包
+	url := "https://nmap.org/dist/nmap-7.99-setup.exe"
+	installerPath := filepath.Join(installDir, "nmap-setup.exe")
+
+	fmt.Printf("[Checker] 正在下载 nmap 安装包: %s\n", url)
+
+	if err := downloadFile(url, installerPath); err != nil {
+		return "", fmt.Errorf("下载 nmap 失败: %v\n请手动下载: https://nmap.org/download.html", err)
+	}
+
+	// 静默安装
+	fmt.Println("[Checker] 正在安装 nmap（静默安装）...")
+	cmd := exec.Command(installerPath, "/S", fmt.Sprintf("/D=%s", nmapDir))
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("nmap 安装失败: %v\n请手动安装: https://nmap.org/download.html", err)
+	}
+
+	// 清理安装包
+	os.Remove(installerPath)
+
+	// 验证
+	if _, err := os.Stat(targetPath); err != nil {
+		return "", fmt.Errorf("nmap 安装失败，请手动安装: https://nmap.org/download.html")
+	}
+
+	fmt.Printf("[Checker] nmap 安装成功: %s\n", targetPath)
+	return targetPath, nil
+}
+
+// CheckAndInstall 检查并自动安装缺失的工具
+// 返回 nmapPath, nucleiPath, warnings
+func CheckAndInstall(nmapPath, nucleiPath string) (string, string, []string) {
+	var warnings []string
+
+	// 检查 nmap
+	nmapResult := CheckNmap(nmapPath)
+	if !nmapResult.Found {
+		fmt.Println("[Checker] nmap 未安装，正在尝试自动下载...")
+		path, err := DownloadNmap()
+		if err != nil {
+			warnings = append(warnings, err.Error())
+			fmt.Printf("[Checker] nmap 自动安装失败: %v\n", err)
+			fmt.Println("[Checker] 端口扫描将使用 Go 原生 TCP 扫描（仅支持常见端口）")
+		} else {
+			nmapPath = path
+			fmt.Printf("[Checker] nmap 已安装: %s\n", path)
+		}
+	} else {
+		fmt.Printf("[Checker] nmap 已就绪: %s %s\n", nmapResult.Path, nmapResult.Version)
+	}
+
+	// 检查 nuclei
+	nucleiResult := CheckNuclei(nucleiPath)
+	if !nucleiResult.Found {
+		fmt.Println("[Checker] nuclei 未安装，正在尝试自动下载...")
+		path, err := DownloadNuclei()
+		if err != nil {
+			warnings = append(warnings, err.Error())
+			fmt.Printf("[Checker] nuclei 自动安装失败: %v\n", err)
+		} else {
+			nucleiPath = path
+			fmt.Printf("[Checker] nuclei 已安装: %s\n", path)
+		}
+	} else {
+		fmt.Printf("[Checker] nuclei 已就绪: %s %s\n", nucleiResult.Path, nucleiResult.Version)
+	}
+
+	return nmapPath, nucleiPath, warnings
+}
+
+func downloadFile(url, filePath string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	f, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// 显示下载进度
+	counter := &writeCounter{}
+	_, err = io.Copy(f, io.TeeReader(resp.Body, counter))
+	fmt.Println() // 换行
+	return err
+}
+
+type writeCounter struct {
+	Total uint64
+}
+
+func (wc *writeCounter) Write(p []byte) (int, error) {
+	n := len(p)
+	wc.Total += uint64(n)
+	wc.PrintProgress()
+	return n, nil
+}
+
+func (wc *writeCounter) PrintProgress() {
+	fmt.Printf("\r[Checker] 下载中... %d MB", wc.Total/1024/1024)
+}
