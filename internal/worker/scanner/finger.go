@@ -121,6 +121,11 @@ func FingerScan(ctx context.Context, targets []string, cfg *config.Config) (map[
 	return results, nil
 }
 
+// InferServiceByPort 根据端口推断服务类型（导出供 worker 使用）
+func InferServiceByPort(target string) string {
+	return inferServiceByPort(target)
+}
+
 // inferServiceByPort 根据端口推断服务类型
 func inferServiceByPort(target string) string {
 	_, port, _ := net.SplitHostPort(target)
@@ -148,18 +153,84 @@ func inferServiceByPort(target string) string {
 func inferCPE(target string, fingers []model.Finger) string {
 	for _, f := range fingers {
 		lower := strings.ToLower(f.Name)
-		// 只处理 Server 头信息（如 "Apache/2.4.38"、"nginx/1.18"）
-		// 这些信息在 HTTP 指纹识别阶段产出，nuclei 可能不会再次识别
+		// 从 Server 头信息提取版本号（如 "Apache/2.4.38"、"nginx/1.18.0"、"PHP/7.4.3"）
 		switch {
 		case strings.Contains(lower, "apache") && !strings.Contains(lower, "tomcat"):
-			return "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*"
+			version := extractVersion(f.Name)
+			return fmt.Sprintf("cpe:2.3:a:apache:http_server:%s:*:*:*:*:*:*:*", version)
 		case strings.Contains(lower, "nginx"):
-			return "cpe:2.3:a:nginx:nginx:*:*:*:*:*:*:*:*"
+			version := extractVersion(f.Name)
+			return fmt.Sprintf("cpe:2.3:a:nginx:nginx:%s:*:*:*:*:*:*:*", version)
 		case strings.Contains(lower, "iis"):
-			return "cpe:2.3:a:microsoft:iis:*:*:*:*:*:*:*:*"
+			version := extractVersion(f.Name)
+			return fmt.Sprintf("cpe:2.3:a:microsoft:iis:%s:*:*:*:*:*:*:*", version)
+		case strings.Contains(lower, "php"):
+			version := extractVersion(f.Name)
+			return fmt.Sprintf("cpe:2.3:a:php:php:%s:*:*:*:*:*:*:*", version)
+		case strings.Contains(lower, "tomcat"):
+			version := extractVersion(f.Name)
+			return fmt.Sprintf("cpe:2.3:a:apache:tomcat:%s:*:*:*:*:*:*:*", version)
+		case strings.Contains(lower, "openssl"):
+			version := extractVersion(f.Name)
+			return fmt.Sprintf("cpe:2.3:a:openssl:openssl:%s:*:*:*:*:*:*:*", version)
+		case strings.Contains(lower, "gunicorn"):
+			version := extractVersion(f.Name)
+			return fmt.Sprintf("cpe:2.3:a:gunicorn:gunicorn:%s:*:*:*:*:*:*:*", version)
 		}
 	}
 	return ""
+}
+
+// extractVersion 从 Server 头提取版本号（如 "Apache/2.4.38" → "2.4.38"）
+func extractVersion(serverHeader string) string {
+	// 查找 / 后的版本号
+	idx := strings.Index(serverHeader, "/")
+	if idx == -1 {
+		return "*"
+	}
+	version := strings.TrimSpace(serverHeader[idx+1:])
+	// 只取第一个空格前的部分（处理 "Apache/2.4.38 (Ubuntu)" 这类格式）
+	if spaceIdx := strings.Index(version, " "); spaceIdx != -1 {
+		version = version[:spaceIdx]
+	}
+	if version == "" {
+		return "*"
+	}
+	return version
+}
+
+// ProbeHTTPService 尝试 HTTP 探测目标是否为 HTTP 服务
+func ProbeHTTPService(ctx context.Context, target string) bool {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: (&net.Dialer{
+				Timeout: 3 * time.Second,
+			}).DialContext,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+
+	for _, scheme := range []string{"https", "http"} {
+		url := fmt.Sprintf("%s://%s", scheme, target)
+		req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; VulnScope/1.0)")
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			return true
+		}
+	}
+	return false
 }
 
 // inferServiceByFingers 从指纹推断服务类型
@@ -208,8 +279,19 @@ func nucleiFingerScan(ctx context.Context, targets []string, cfg *config.Config)
 
 	log.Printf("[FingerScan] Found %d HTTP finger template paths", len(fingerPaths))
 
+	// 写入临时目标文件
+	targetFile, err := os.CreateTemp("", "nuclei-finger-http-*.txt")
+	if err != nil {
+		return nil, fmt.Errorf("创建临时目标文件失败: %v", err)
+	}
+	defer os.Remove(targetFile.Name())
+	for _, t := range targets {
+		fmt.Fprintln(targetFile, t)
+	}
+	targetFile.Close()
+
 	args := []string{
-		"-u", strings.Join(targets, ","),
+		"-l", targetFile.Name(),
 		"-j",
 		"-silent",
 		"-timeout", "10",  // 每个请求超时10秒
@@ -317,8 +399,19 @@ func nucleiNetworkFingerScan(ctx context.Context, targets []string, cfg *config.
 		return nil, fmt.Errorf("network detection templates not found: %s", detectDir)
 	}
 
+	// 写入临时目标文件
+	targetFile, err := os.CreateTemp("", "nuclei-finger-net-*.txt")
+	if err != nil {
+		return nil, fmt.Errorf("创建临时目标文件失败: %v", err)
+	}
+	defer os.Remove(targetFile.Name())
+	for _, t := range targets {
+		fmt.Fprintln(targetFile, t)
+	}
+	targetFile.Close()
+
 	args := []string{
-		"-u", strings.Join(targets, ","),
+		"-l", targetFile.Name(),
 		"-j",
 		"-silent",
 		"-timeout", "10",

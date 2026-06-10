@@ -112,17 +112,7 @@ func (w *Worker) enqueueNextStage(currentStage string, taskID uint, targets []st
 		return nil
 	}
 
-	// 更新进度
-	task, err := w.store.GetTask(taskID)
-	if err != nil {
-		return err
-	}
-	task.Progress = nextProgress
-	if err := w.store.UpdateTask(task); err != nil {
-		return err
-	}
-
-	// 直接入队 Redis
+	// 先入队 Redis（关键操作），再更新进度（如果入队失败，进度不会被错误更新）
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -133,7 +123,14 @@ func (w *Worker) enqueueNextStage(currentStage string, taskID uint, targets []st
 		return err
 	}
 	log.Printf("[Worker] Enqueued next stage %s, task_id=%d, asynq_id=%s", nextType, taskID, info.ID)
-	return nil
+
+	// 入队成功后再更新进度
+	task, err := w.store.GetTask(taskID)
+	if err != nil {
+		return err
+	}
+	task.Progress = nextProgress
+	return w.store.UpdateTask(task)
 }
 
 func (w *Worker) handleDomainScan(ctx context.Context, t *asynq.Task) error {
@@ -159,6 +156,7 @@ func (w *Worker) handleDomainScan(ctx context.Context, t *asynq.Task) error {
 	}
 
 	w.logTask(p.TaskID, "domain", "info", fmt.Sprintf("域名扫描完成，发现 %d 个域名/IP", len(results)))
+	w.markStageCompleted(p.TaskID, "domain")
 
 	for _, r := range results {
 		asset := r.ToAsset(p.TaskID)
@@ -212,6 +210,7 @@ func (w *Worker) handleAliveScan(ctx context.Context, t *asynq.Task) error {
 		}
 	}
 	w.logTask(p.TaskID, "alive", "info", fmt.Sprintf("存活探测完成，存活目标数: %d", aliveCount))
+	w.markStageCompleted(p.TaskID, "alive")
 
 	var aliveTargets []string
 	for _, r := range results {
@@ -277,19 +276,16 @@ func (w *Worker) handlePortScan(ctx context.Context, t *asynq.Task) error {
 	// 对已带端口的目标，直接添加为开放端口
 	for _, target := range targetsWithPort {
 		host, portStr, _ := net.SplitHostPort(target)
-		portNum := 0
-		for _, c := range portStr {
-			if c >= '0' && c <= '9' {
-				portNum = portNum*10 + int(c-'0')
-			}
+		portNum, err := strconv.Atoi(portStr)
+		if err != nil || portNum <= 0 {
+			log.Printf("[Worker] Invalid port in target %s, skipping", target)
+			continue
 		}
-		if portNum > 0 {
-			results[host] = append(results[host], model.Port{
-				Port:     portNum,
-				Protocol: "tcp",
-				State:    "open",
-			})
-		}
+		results[host] = append(results[host], model.Port{
+			Port:     portNum,
+			Protocol: "tcp",
+			State:    "open",
+		})
 	}
 
 	// 构建带端口的目标列表，传递给下一阶段
@@ -320,6 +316,7 @@ func (w *Worker) handlePortScan(ctx context.Context, t *asynq.Task) error {
 
 	log.Printf("[Worker] Port scan found %d open ports, passing to next stage: %v", len(nextTargets), nextTargets)
 	w.logTask(p.TaskID, "port", "info", fmt.Sprintf("端口扫描完成，发现 %d 个开放端口", len(nextTargets)))
+	w.markStageCompleted(p.TaskID, "port")
 	return w.enqueueNextStage("port", p.TaskID, nextTargets)
 }
 
@@ -350,6 +347,7 @@ func (w *Worker) handleFingerScan(ctx context.Context, t *asynq.Task) error {
 		fingerCount += len(result.Fingers)
 	}
 	w.logTask(p.TaskID, "finger", "info", fmt.Sprintf("指纹识别完成，发现 %d 个指纹", fingerCount))
+	w.markStageCompleted(p.TaskID, "finger")
 
 	for target, result := range results {
 		// 从 target (host:port) 中提取 host 用于匹配资产
@@ -474,28 +472,45 @@ func (w *Worker) handleVulnScan(ctx context.Context, t *asynq.Task) error {
 			}
 		}
 
-		// 如果指纹识别没有产出 service，跳过该目标的漏洞扫描
-		if info.Service == "" {
-			log.Printf("[Worker] Target %s has no service identified, skipping vuln scan", target)
-			continue
+		// 端口推断：当数据库 service 是通用值（如 http）或为空时，用端口推断更精确的服务
+		inferredService := scanner.InferServiceByPort(target)
+		if inferredService != "" {
+			// 端口推断的服务比通用 http 更精确时，覆盖
+			if info.Service == "" || info.Service == "unknown" ||
+				(info.Service == "http" && inferredService != "http") {
+				log.Printf("[Worker] Target %s service overridden by port inference: %s -> %s", target, info.Service, inferredService)
+				info.Service = inferredService
+			}
 		}
+
+		// 如果仍无法推断 service，尝试 HTTP 探测
+		if info.Service == "" {
+			if scanner.ProbeHTTPService(ctx, target) {
+				info.Service = "http"
+				log.Printf("[Worker] Target %s detected as HTTP by probe", target)
+			}
+		}
+
+		// 实在无法确定服务类型，默认按 http 处理（覆盖面最广）
+		if info.Service == "" {
+			info.Service = "http"
+			log.Printf("[Worker] Target %s defaulting to http for vuln scan", target)
+		}
+
 		targetInfos = append(targetInfos, info)
 	}
 
-	// 如果没有可扫描的目标，直接完成
-	if len(targetInfos) == 0 {
-		w.logTask(p.TaskID, "vuln", "info", "所有目标均未识别出服务，跳过漏洞扫描")
-		task, _ := w.store.GetTask(p.TaskID)
-		task.Status = "completed"
-		task.Progress = "done"
-		return w.store.UpdateTask(task)
-	}
-
-	// 构建有 service 的目标列表
+	// 构建目标列表（HTTP 服务需要加协议前缀，否则 nuclei 无法正确发送 HTTP 请求）
 	var validTargets []string
 	for _, info := range targetInfos {
-		validTargets = append(validTargets, info.Target)
+		target := info.Target
+		// 判断是否为 HTTP 类服务，需要添加 http:// 前缀
+		if isHTTPService(info.Service) && !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+			target = "http://" + target
+		}
+		validTargets = append(validTargets, target)
 	}
+	log.Printf("[Worker] Vuln scan validTargets: %v", validTargets)
 
 	// 模板匹配：为每个目标找到匹配的漏洞模板（仅用于日志记录）
 	totalMatched := 0
@@ -523,6 +538,7 @@ func (w *Worker) handleVulnScan(ctx context.Context, t *asynq.Task) error {
 	}
 
 	w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("漏洞扫描完成，发现 %d 个漏洞", len(vulns)))
+	w.markStageCompleted(p.TaskID, "vuln")
 	for _, v := range vulns {
 		w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("- %s [%s] %s", v.Name, v.Severity, v.URL))
 	}
@@ -562,10 +578,38 @@ func (w *Worker) failTask(taskID uint, errMsg string) {
 }
 
 // isStageCompleted 检查该阶段是否已完成（幂等检查，防止重启后重复执行）
+// 使用 Task.CompletedStages 字段而非 LIKE 查询，更可靠
 func (w *Worker) isStageCompleted(taskID uint, stage string) bool {
-	var count int64
-	w.store.DB.Model(&model.TaskLog{}).Where("task_id = ? AND stage = ? AND level = 'info' AND message LIKE ?", taskID, stage, "%完成%").Count(&count)
-	return count > 0
+	task, err := w.store.GetTask(taskID)
+	if err != nil {
+		return false
+	}
+	for _, s := range strings.Split(task.CompletedStages, ",") {
+		if s == stage {
+			return true
+		}
+	}
+	return false
+}
+
+// markStageCompleted 标记阶段完成
+func (w *Worker) markStageCompleted(taskID uint, stage string) {
+	task, err := w.store.GetTask(taskID)
+	if err != nil {
+		return
+	}
+	stages := strings.Split(task.CompletedStages, ",")
+	for _, s := range stages {
+		if s == stage {
+			return // 已经标记
+		}
+	}
+	if task.CompletedStages == "" {
+		task.CompletedStages = stage
+	} else {
+		task.CompletedStages = task.CompletedStages + "," + stage
+	}
+	w.store.UpdateTask(task)
 }
 
 // logTask 记录任务执行日志
@@ -579,4 +623,15 @@ func (w *Worker) logTask(taskID uint, stage, level, message string) {
 	if err := w.store.CreateTaskLog(logEntry); err != nil {
 		log.Printf("[Worker] Failed to write task log: %v", err)
 	}
+}
+
+// isHTTPService 判断服务是否为 HTTP 类服务，需要加 http:// 前缀
+func isHTTPService(service string) bool {
+	httpServices := map[string]bool{
+		"http": true, "http-alt": true, "http-proxy": true, "https": true,
+		"https-alt": true, "www": true, "web": true, "gunicorn": true,
+		"nginx": true, "apache": true, "tomcat": true, "iis": true,
+		"jetty": true, "lighttpd": true, "caddy": true,
+	}
+	return httpServices[service]
 }

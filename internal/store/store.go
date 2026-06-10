@@ -185,8 +185,7 @@ func (s *Store) ListAssetsDedup(offset, limit int) ([]model.AssetDedup, int64, e
 		) sub
 	`).Scan(&total)
 
-	// 去重查询：先按 key 分组得到去重后的 key 列表，再关联查询详情
-	// 使用子查询方式避免 only_full_group_by 问题
+	// 优化查询：使用 LEFT JOIN 替代关联子查询，避免 N+1 问题
 	err := s.DB.Raw(`
 		SELECT 
 			sub.id,
@@ -197,12 +196,8 @@ func (s *Store) ListAssetsDedup(offset, limit int) ([]model.AssetDedup, int64, e
 			sub.response_time,
 			sub.title,
 			sub.task_count,
-			(SELECT COUNT(*) FROM ports WHERE asset_id IN (
-				SELECT id FROM assets a3 WHERE COALESCE(NULLIF(a3.ip,''), a3.domain) = sub.dedup_key
-			)) AS port_count,
-			(SELECT COUNT(*) FROM fingers WHERE asset_id IN (
-				SELECT id FROM assets a3 WHERE COALESCE(NULLIF(a3.ip,''), a3.domain) = sub.dedup_key
-			)) AS finger_count
+			COALESCE(p.port_count, 0) AS port_count,
+			COALESCE(f.finger_count, 0) AS finger_count
 		FROM (
 			SELECT 
 				MAX(a.id) AS id,
@@ -220,6 +215,24 @@ func (s *Store) ListAssetsDedup(offset, limit int) ([]model.AssetDedup, int64, e
 			ORDER BY MAX(a.id) DESC
 			LIMIT ? OFFSET ?
 		) sub
+		LEFT JOIN (
+			SELECT a2.dedup_key, COUNT(DISTINCT p2.id) AS port_count
+			FROM (
+				SELECT COALESCE(NULLIF(ip,''), domain) AS dedup_key, id
+				FROM assets WHERE ip != '' OR domain != ''
+			) a2
+			JOIN ports p2 ON p2.asset_id = a2.id
+			GROUP BY a2.dedup_key
+		) p ON p.dedup_key = sub.dedup_key
+		LEFT JOIN (
+			SELECT a3.dedup_key, COUNT(DISTINCT f2.id) AS finger_count
+			FROM (
+				SELECT COALESCE(NULLIF(ip,''), domain) AS dedup_key, id
+				FROM assets WHERE ip != '' OR domain != ''
+			) a3
+			JOIN fingers f2 ON f2.asset_id = a3.id
+			GROUP BY a3.dedup_key
+		) f ON f.dedup_key = sub.dedup_key
 	`, limit, offset).Scan(&results).Error
 
 	return results, total, err
@@ -294,6 +307,19 @@ func (s *Store) ListFingers(assetID uint) ([]model.Finger, error) {
 // ========== Vuln ==========
 
 func (s *Store) CreateVuln(v *model.Vuln) error {
+	// 去重：同一任务+同一模板+同一URL 不重复插入
+	var existing model.Vuln
+	err := s.DB.Where("task_id = ? AND template_id = ? AND url = ?", v.TaskID, v.TemplateID, v.URL).First(&existing).Error
+	if err == nil {
+		// 已存在，更新严重级别和证据
+		if v.Severity != "" {
+			existing.Severity = v.Severity
+		}
+		if v.Evidence != "" {
+			existing.Evidence = v.Evidence
+		}
+		return s.DB.Save(&existing).Error
+	}
 	return s.DB.Create(v).Error
 }
 

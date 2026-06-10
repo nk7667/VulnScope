@@ -128,54 +128,6 @@ func (s *Scheduler) enqueue(taskType string, payload ScanPayload, priority int) 
 	return nil
 }
 
-// EnqueueNextStage 由 worker 调用，触发下一阶段扫描
-func (s *Scheduler) EnqueueNextStage(currentStage string, taskID uint, targets []string) error {
-	payload := ScanPayload{
-		TaskID:  taskID,
-		Targets: targets,
-	}
-
-	var nextType string
-	var nextProgress string
-	switch currentStage {
-	case "domain":
-		nextType = TypeAliveScan
-		nextProgress = "alive"
-	case "alive":
-		nextType = TypePortScan
-		nextProgress = "port"
-	case "port":
-		nextType = TypeFingerScan
-		nextProgress = "finger"
-	case "finger":
-		nextType = TypeVulnScan
-		nextProgress = "vuln"
-	case "vuln":
-		// 流水线完成
-		task, err := s.store.GetTask(taskID)
-		if err != nil {
-			return err
-		}
-		task.Status = "completed"
-		task.Progress = "done"
-		return s.store.UpdateTask(task)
-	default:
-		return nil
-	}
-
-	// 更新进度
-	task, err := s.store.GetTask(taskID)
-	if err != nil {
-		return err
-	}
-	task.Progress = nextProgress
-	if err := s.store.UpdateTask(task); err != nil {
-		return err
-	}
-
-	return s.enqueue(nextType, payload, 3)
-}
-
 func (s *Scheduler) Close() error {
 	return s.client.Close()
 }

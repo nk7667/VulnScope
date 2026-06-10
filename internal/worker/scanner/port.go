@@ -72,13 +72,25 @@ func nmapScan(ctx context.Context, target, nmapPath string) ([]model.Port, error
 		if port.State == "open" {
 			verifiedPorts = append(verifiedPorts, port)
 		} else if port.State == "filtered" {
-			// TCP 连接验证
+			// TCP 连接验证 + Banner 读取
 			addr := fmt.Sprintf("%s:%d", target, port.Port)
 			dialer := net.Dialer{Timeout: 2 * time.Second}
 			conn, err := dialer.DialContext(ctx, "tcp", addr)
 			if err == nil {
+				// 尝试读取 Banner 确认端口真正可用
+				conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				buf := make([]byte, 256)
+				n, _ := conn.Read(buf)
 				conn.Close()
+
 				port.State = "open"
+				if n > 0 {
+					port.Banner = strings.TrimSpace(string(buf[:n]))
+					// 从 Banner 推断 service
+					if port.Service == "" || port.Service == "unknown" {
+						port.Service = guessService(port.Port)
+					}
+				}
 				verifiedPorts = append(verifiedPorts, port)
 			}
 		}

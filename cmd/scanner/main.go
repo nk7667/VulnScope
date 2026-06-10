@@ -88,7 +88,7 @@ func main() {
 
 	// 启动 API Server
 	if startServer {
-		r := server.SetupRouter(s, sched)
+		r := server.SetupRouter(s, sched, cfg)
 		go func() {
 			if err := r.Run(cfg.Server.Addr); err != nil {
 				log.Fatalf("API Server 启动失败: %v", err)

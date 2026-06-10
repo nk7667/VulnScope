@@ -3,6 +3,7 @@ package checker
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -84,7 +85,11 @@ func InstallDir() string {
 // DownloadNuclei 下载 nuclei
 func DownloadNuclei() (string, error) {
 	installDir := InstallDir()
-	targetPath := filepath.Join(installDir, "nuclei.exe")
+	exeName := "nuclei"
+	if runtime.GOOS == "windows" {
+		exeName = "nuclei.exe"
+	}
+	targetPath := filepath.Join(installDir, exeName)
 
 	// 如果已存在，直接返回
 	if _, err := os.Stat(targetPath); err == nil {
@@ -93,7 +98,7 @@ func DownloadNuclei() (string, error) {
 
 	// 确定 GitHub release 下载 URL
 	goos := runtime.GOOS
-	arch := runtime.GOOS
+	arch := runtime.GOARCH
 	if runtime.GOARCH == "amd64" {
 		arch = "amd64"
 	} else {
@@ -104,7 +109,7 @@ func DownloadNuclei() (string, error) {
 	zipName := fmt.Sprintf("nuclei_%s_%s.zip", goos, arch)
 	url := fmt.Sprintf("https://github.com/projectdiscovery/nuclei/releases/latest/download/%s", zipName)
 
-	fmt.Printf("[Checker] 正在下载 nuclei: %s\n", url)
+	log.Printf("[Checker] 正在下载 nuclei: %s\n", url)
 
 	zipPath := filepath.Join(installDir, zipName)
 	if err := downloadFile(url, zipPath); err != nil {
@@ -112,10 +117,16 @@ func DownloadNuclei() (string, error) {
 	}
 
 	// 解压
-	fmt.Println("[Checker] 正在解压 nuclei...")
-	if err := exec.Command("powershell", "-Command",
-		fmt.Sprintf("Expand-Archive -Path '%s' -DestinationPath '%s' -Force", zipPath, installDir)).Run(); err != nil {
-		return "", fmt.Errorf("解压失败: %v", err)
+	log.Println("[Checker] 正在解压 nuclei...")
+	if runtime.GOOS == "windows" {
+		if err := exec.Command("powershell", "-Command",
+			fmt.Sprintf("Expand-Archive -Path '%s' -DestinationPath '%s' -Force", zipPath, installDir)).Run(); err != nil {
+			return "", fmt.Errorf("解压失败: %v", err)
+		}
+	} else {
+		if err := exec.Command("unzip", "-o", zipPath, "-d", installDir).Run(); err != nil {
+			return "", fmt.Errorf("解压失败: %v (请安装 unzip)", err)
+		}
 	}
 
 	// 清理 zip
@@ -128,7 +139,7 @@ func DownloadNuclei() (string, error) {
 			if err != nil {
 				return nil
 			}
-			if info.Name() == "nuclei.exe" {
+			if info.Name() == exeName {
 				os.Rename(path, targetPath)
 				return filepath.SkipAll
 			}
@@ -140,7 +151,7 @@ func DownloadNuclei() (string, error) {
 		return "", fmt.Errorf("nuclei 安装失败，请手动下载: https://github.com/projectdiscovery/nuclei/releases")
 	}
 
-	fmt.Printf("[Checker] nuclei 安装成功: %s\n", targetPath)
+	log.Printf("[Checker] nuclei 安装成功: %s\n", targetPath)
 	return targetPath, nil
 }
 
@@ -159,7 +170,7 @@ func DownloadNmap() (string, error) {
 	url := "https://nmap.org/dist/nmap-7.99-setup.exe"
 	installerPath := filepath.Join(installDir, "nmap-setup.exe")
 
-	fmt.Printf("[Checker] 正在下载 nmap 安装包: %s\n", url)
+	log.Printf("[Checker] 正在下载 nmap 安装包: %s\n", url)
 
 	if err := downloadFile(url, installerPath); err != nil {
 		return "", fmt.Errorf("下载 nmap 失败: %v\n请手动下载: https://nmap.org/download.html", err)
@@ -180,7 +191,7 @@ func DownloadNmap() (string, error) {
 		return "", fmt.Errorf("nmap 安装失败，请手动安装: https://nmap.org/download.html")
 	}
 
-	fmt.Printf("[Checker] nmap 安装成功: %s\n", targetPath)
+	log.Printf("[Checker] nmap 安装成功: %s\n", targetPath)
 	return targetPath, nil
 }
 
@@ -192,34 +203,34 @@ func CheckAndInstall(nmapPath, nucleiPath string) (string, string, []string) {
 	// 检查 nmap
 	nmapResult := CheckNmap(nmapPath)
 	if !nmapResult.Found {
-		fmt.Println("[Checker] nmap 未安装，正在尝试自动下载...")
+		log.Println("[Checker] nmap 未安装，正在尝试自动下载...")
 		path, err := DownloadNmap()
 		if err != nil {
 			warnings = append(warnings, err.Error())
-			fmt.Printf("[Checker] nmap 自动安装失败: %v\n", err)
-			fmt.Println("[Checker] 端口扫描将使用 Go 原生 TCP 扫描（仅支持常见端口）")
+			log.Printf("[Checker] nmap 自动安装失败: %v\n", err)
+			log.Println("[Checker] 端口扫描将使用 Go 原生 TCP 扫描（仅支持常见端口）")
 		} else {
 			nmapPath = path
-			fmt.Printf("[Checker] nmap 已安装: %s\n", path)
+			log.Printf("[Checker] nmap 已安装: %s\n", path)
 		}
 	} else {
-		fmt.Printf("[Checker] nmap 已就绪: %s %s\n", nmapResult.Path, nmapResult.Version)
+		log.Printf("[Checker] nmap 已就绪: %s %s\n", nmapResult.Path, nmapResult.Version)
 	}
 
 	// 检查 nuclei
 	nucleiResult := CheckNuclei(nucleiPath)
 	if !nucleiResult.Found {
-		fmt.Println("[Checker] nuclei 未安装，正在尝试自动下载...")
+		log.Println("[Checker] nuclei 未安装，正在尝试自动下载...")
 		path, err := DownloadNuclei()
 		if err != nil {
 			warnings = append(warnings, err.Error())
-			fmt.Printf("[Checker] nuclei 自动安装失败: %v\n", err)
+			log.Printf("[Checker] nuclei 自动安装失败: %v\n", err)
 		} else {
 			nucleiPath = path
-			fmt.Printf("[Checker] nuclei 已安装: %s\n", path)
+			log.Printf("[Checker] nuclei 已安装: %s\n", path)
 		}
 	} else {
-		fmt.Printf("[Checker] nuclei 已就绪: %s %s\n", nucleiResult.Path, nucleiResult.Version)
+		log.Printf("[Checker] nuclei 已就绪: %s %s\n", nucleiResult.Path, nucleiResult.Version)
 	}
 
 	return nmapPath, nucleiPath, warnings
@@ -261,5 +272,5 @@ func (wc *writeCounter) Write(p []byte) (int, error) {
 }
 
 func (wc *writeCounter) PrintProgress() {
-	fmt.Printf("\r[Checker] 下载中... %d MB", wc.Total/1024/1024)
+	log.Printf("\r[Checker] 下载中... %d MB", wc.Total/1024/1024)
 }

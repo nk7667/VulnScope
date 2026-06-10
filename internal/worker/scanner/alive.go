@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -19,6 +20,12 @@ type AliveResult struct {
 	ResponseTime int // 毫秒
 	Title        string
 	RedirectURL  string
+}
+
+// 常见端口列表，用于 TCP 存活探测
+var commonAlivePorts = []string{
+	"80", "443", "8080", "8443", "22", "21", "25", "3389",
+	"3306", "5432", "6379", "27017", "8000", "8888", "3000",
 }
 
 // AliveScan 存活探测
@@ -44,8 +51,7 @@ func AliveScan(ctx context.Context, targets []string, cfg *config.Config) ([]Ali
 		result := AliveResult{Target: target}
 
 		// 解析目标，分离主机和端口
-		host, port, err := net.SplitHostPort(target)
-		fmt.Printf("[AliveScan] target=%s, host=%s, port=%s, err=%v\n", target, host, port, err)
+		host, port, _ := net.SplitHostPort(target)
 		if host == "" {
 			host = target
 		}
@@ -53,7 +59,6 @@ func AliveScan(ctx context.Context, targets []string, cfg *config.Config) ([]Ali
 		// 如果目标带端口，尝试 TCP 连接验证
 		if port != "" {
 			conn, err := net.DialTimeout("tcp", target, 3*time.Second)
-			fmt.Printf("[AliveScan] TCP dial %s: err=%v\n", target, err)
 			if err == nil {
 				result.Alive = true
 				conn.Close()
@@ -63,11 +68,15 @@ func AliveScan(ctx context.Context, targets []string, cfg *config.Config) ([]Ali
 			if ping(host) {
 				result.Alive = true
 			}
+			// ICMP 失败，尝试常见端口 TCP 探测
+			if !result.Alive {
+				result.Alive = tcpProbe(host)
+			}
 		}
 
 		// 如果已经确认存活，跳过 HTTP 探测
 		if result.Alive {
-			fmt.Printf("[AliveScan] Target %s is alive (TCP), skipping HTTP\n", target)
+			log.Printf("[AliveScan] Target %s is alive (TCP/ICMP), skipping HTTP", target)
 			results = append(results, result)
 			continue
 		}
@@ -100,6 +109,7 @@ func AliveScan(ctx context.Context, targets []string, cfg *config.Config) ([]Ali
 	return results, nil
 }
 
+// ping 尝试 ICMP 探测（需要管理员/root 权限）
 func ping(host string) bool {
 	conn, err := net.DialTimeout("ip4:icmp", host, 3*time.Second)
 	if err != nil {
@@ -107,6 +117,20 @@ func ping(host string) bool {
 	}
 	conn.Close()
 	return true
+}
+
+// tcpProbe 尝试常见端口的 TCP 连接探测
+func tcpProbe(host string) bool {
+	for _, port := range commonAlivePorts {
+		addr := net.JoinHostPort(host, port)
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err == nil {
+			conn.Close()
+			log.Printf("[AliveScan] TCP probe %s:%s succeeded", host, port)
+			return true
+		}
+	}
+	return false
 }
 
 func extractTitle(resp *http.Response) string {

@@ -16,7 +16,9 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Addr string `yaml:"addr"`
+	Addr           string `yaml:"addr"`
+	APIKey         string `yaml:"api_key"`          // API Key 认证，为空则不启用
+	AllowedOrigins string `yaml:"allowed_origins"`  // CORS 允许的来源，为空则允许所有
 }
 
 type DBConfig struct {

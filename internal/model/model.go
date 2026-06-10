@@ -16,17 +16,18 @@ type Target struct {
 
 // Task 扫描任务
 type Task struct {
-	ID          uint      `gorm:"primaryKey" json:"id"`
-	Name        string    `gorm:"not null" json:"name"`         // 任务名称
-	TargetIDs   string    `gorm:"not null" json:"target_ids"`   // 关联的目标ID, 逗号分隔
-	Type        int       `gorm:"default:0" json:"type"`        // 0:常规, 1:复测
-	Status      string    `gorm:"default:pending" json:"status"`   // pending/running/completed/failed
-	Progress    string    `gorm:"default:''" json:"progress"`  // 当前阶段: domain/alive/port/finger/vuln
-	Error       string    `json:"error"`                        // 错误信息
-	VulnCount   int       `gorm:"-" json:"vuln_count"`          // 漏洞数量（动态计算）
-	FingerCount int       `gorm:"-" json:"finger_count"`        // 指纹数量（动态计算）
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID              uint      `gorm:"primaryKey" json:"id"`
+	Name            string    `gorm:"not null" json:"name"`         // 任务名称
+	TargetIDs       string    `gorm:"not null" json:"target_ids"`   // 关联的目标ID, 逗号分隔
+	Type            int       `gorm:"default:0" json:"type"`        // 0:常规, 1:复测
+	Status          string    `gorm:"default:pending" json:"status"`   // pending/running/completed/failed
+	Progress        string    `gorm:"default:''" json:"progress"`  // 当前阶段: domain/alive/port/finger/vuln
+	CompletedStages string    `gorm:"default:''" json:"completed_stages"` // 已完成阶段，逗号分隔（用于幂等检查）
+	Error           string    `json:"error"`                        // 错误信息
+	VulnCount       int       `gorm:"-" json:"vuln_count"`          // 漏洞数量（动态计算）
+	FingerCount     int       `gorm:"-" json:"finger_count"`        // 指纹数量（动态计算）
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // Asset 扫描产出的资产

@@ -1,27 +1,49 @@
 package server
 
 import (
+	"blackbox-scanner/internal/config"
 	"blackbox-scanner/internal/scheduler"
 	"blackbox-scanner/internal/server/handler"
 	"blackbox-scanner/internal/store"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 )
 
-func SetupRouter(s *store.Store, sched *scheduler.Scheduler) *gin.Engine {
+func SetupRouter(s *store.Store, sched *scheduler.Scheduler, cfg *config.Config) *gin.Engine {
 	r := gin.Default()
 
 	// CORS — 前端独立部署，跨域访问 API
+	allowedOrigins := cfg.Server.AllowedOrigins
+	if allowedOrigins == "" {
+		allowedOrigins = "*"
+	}
 	r.Use(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Origin", allowedOrigins)
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
 		}
 		c.Next()
 	})
+
+	// API Key 认证中间件
+	if cfg.Server.APIKey != "" {
+		r.Use(func(c *gin.Context) {
+			// 从 Header 或 Query 参数获取 API Key
+			key := c.GetHeader("X-API-Key")
+			if key == "" {
+				key = c.Query("api_key")
+			}
+			if key != cfg.Server.APIKey {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "无效的 API Key"})
+				return
+			}
+			c.Next()
+		})
+	}
 
 	api := r.Group("/api")
 	{
