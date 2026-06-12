@@ -8,6 +8,7 @@ import (
 	"vulnscope/internal/server"
 	"vulnscope/internal/store"
 	worker "vulnscope/internal/worker"
+	"vulnscope/internal/worker/scanner"
 	"flag"
 	"fmt"
 	"log"
@@ -124,6 +125,9 @@ func main() {
 		w.Shutdown()
 		log.Println("[Main] Worker 已关闭")
 	}
+
+	// 关闭浏览器实例，防止 Chrome 进程残留
+	scanner.CloseBrowser()
 
 	// 关闭 Scheduler 的 asynq.Client
 	if sched != nil {

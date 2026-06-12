@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -125,8 +126,11 @@ func ping(host string) bool {
 	// 首次调用时检测 ICMP 是否可用
 	icmpOnce.Do(func() {
 		// 非 Windows 系统检查是否 root，Windows 检查是否管理员
-		if os.Getuid() != 0 && !isWindowsAdmin() {
-			log.Printf("[AliveScan] ICMP: 非 root/管理员权限，ICMP 探测将跳过")
+		if runtime.GOOS != "windows" && os.Getuid() != 0 {
+			log.Printf("[AliveScan] ICMP: 非 root 权限，ICMP 探测将跳过")
+			icmpSupported = false
+		} else if runtime.GOOS == "windows" && !isWindowsAdmin() {
+			log.Printf("[AliveScan] ICMP: 非管理员权限，ICMP 探测将跳过")
 			icmpSupported = false
 		}
 	})
@@ -147,31 +151,26 @@ func ping(host string) bool {
 	}
 
 	// 构造 ICMP Echo Request 包
-	// Type(1) + Code(1) + Checksum(2) + Identifier(2) + Sequence(2) + Data
-	const icmpEchoRequest = 8
-	const icmpCode = 0
+	// ICMP 规范: Type(1字节) + Code(1字节) + Checksum(2字节) + Identifier(2字节) + Sequence(2字节) + Data
+	const icmpEchoRequest uint8 = 8
+	const icmpCode uint8 = 0
 
-	// ICMP 头部 + 时间戳数据
-	type ICMPHeader struct {
-		Type     uint8
-		Code     uint8
-		Checksum uint16
-		ID       uint16
-		Seq      uint16
-	}
-
-	header := ICMPHeader{
-		Type: icmpEchoRequest,
-		Code: icmpCode,
-		ID:   uint16(os.Getpid() & 0xffff),
-		Seq:  1,
-	}
-
-	// 构造完整 ICMP 包（头部 + 8 字节时间戳数据）
+	// ICMP 头部 + 8 字节时间戳数据
 	packet := make([]byte, 8+8)
-	binary.BigEndian.PutUint16(packet[0:2], uint16(header.Type)<<8|uint16(header.Code))
-	binary.BigEndian.PutUint16(packet[4:6], header.ID)
-	binary.BigEndian.PutUint16(packet[6:8], header.Seq)
+
+	// 按 ICMP 规范逐字节写入头部
+	packet[0] = icmpEchoRequest  // Type
+	packet[1] = icmpCode         // Code
+	// Checksum 先填 0，后面计算
+	packet[2] = 0
+	packet[3] = 0
+	// Identifier: 使用进程 ID（大端序）
+	id := uint16(os.Getpid() & 0xffff)
+	packet[4] = byte(id >> 8)
+	packet[5] = byte(id)
+	// Sequence
+	packet[6] = 0
+	packet[7] = 1
 
 	// 填充时间戳作为数据
 	now := time.Now().UnixNano()
@@ -179,10 +178,11 @@ func ping(host string) bool {
 
 	// 计算校验和
 	checksum := calcICMPChecksum(packet)
-	binary.BigEndian.PutUint16(packet[2:4], checksum)
+	packet[2] = byte(checksum >> 8)
+	packet[3] = byte(checksum)
 
-	// 发送 ICMP 包
-	conn, err := net.DialIP("ip4:icmp", nil, &net.IPAddr{IP: dstIP})
+	// 使用 ListenIP 发送 ICMP 包（无连接协议的正确用法）
+	conn, err := net.ListenIP("ip4:icmp", nil)
 	if err != nil {
 		// 权限不足或系统不支持 raw socket
 		icmpSupported = false
@@ -190,14 +190,16 @@ func ping(host string) bool {
 	}
 	defer conn.Close()
 
+	// 发送到目标
+	dstAddr := &net.IPAddr{IP: dstIP}
 	conn.SetDeadline(time.Now().Add(3 * time.Second))
-	if _, err := conn.Write(packet); err != nil {
+	if _, err := conn.WriteToIP(packet, dstAddr); err != nil {
 		return false
 	}
 
 	// 读取响应
 	resp := make([]byte, 128)
-	n, err := conn.Read(resp)
+	n, _, err := conn.ReadFromIP(resp)
 	if err != nil {
 		return false
 	}

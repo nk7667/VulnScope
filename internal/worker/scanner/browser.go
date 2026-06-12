@@ -30,7 +30,7 @@ type BrowserResult struct {
 var (
 	browserInstance *rod.Browser
 	browserOnce     sync.Once
-	browserMu       sync.Mutex
+	browserSem      = make(chan struct{}, 3) // 最多 3 个并发浏览器操作
 )
 
 // getBrowser 获取或初始化浏览器实例（单例模式）
@@ -71,8 +71,8 @@ func getBrowser(cfg *config.Config) (*rod.Browser, error) {
 // BrowserRender 使用 Chrome 无头浏览器渲染页面
 // 用于需要 JS 执行的指纹识别和漏洞扫描
 func BrowserRender(ctx context.Context, url string, cfg *config.Config) (*BrowserResult, error) {
-	browserMu.Lock()
-	defer browserMu.Unlock()
+	browserSem <- struct{}{} // 获取信号量
+	defer func() { <-browserSem }()
 
 	b, err := getBrowser(cfg)
 	if err != nil {
@@ -85,7 +85,10 @@ func BrowserRender(ctx context.Context, url string, cfg *config.Config) (*Browse
 		timeout = time.Duration(cfg.Scanner.FingerTimeout) * time.Second
 	}
 
-	page := b.MustPage(url)
+	page, err := b.Page(proto.TargetCreateTarget{URL: url})
+	if err != nil {
+		return nil, fmt.Errorf("打开页面失败: %v", err)
+	}
 	defer page.Close()
 
 	// 设置页面超时
@@ -216,15 +219,18 @@ func CloseBrowser() {
 
 // GetPageDOM 获取页面的 DOM 信息（用于深度指纹识别）
 func GetPageDOM(ctx context.Context, url string, cfg *config.Config) (map[string]string, error) {
-	browserMu.Lock()
-	defer browserMu.Unlock()
+	browserSem <- struct{}{} // 获取信号量
+	defer func() { <-browserSem }()
 
 	b, err := getBrowser(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	page := b.MustPage(url)
+	page, err := b.Page(proto.TargetCreateTarget{URL: url})
+	if err != nil {
+		return nil, fmt.Errorf("打开页面失败: %v", err)
+	}
 	defer page.Close()
 
 	page = page.Timeout(30 * time.Second)
@@ -260,15 +266,18 @@ func GetPageDOM(ctx context.Context, url string, cfg *config.Config) (map[string
 
 // NavigateWithHeaders 使用自定义 Headers 导航
 func NavigateWithHeaders(ctx context.Context, url string, headers map[string]string, cfg *config.Config) (*BrowserResult, error) {
-	browserMu.Lock()
-	defer browserMu.Unlock()
+	browserSem <- struct{}{} // 获取信号量
+	defer func() { <-browserSem }()
 
 	b, err := getBrowser(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	page := b.MustPage("")
+	page, err := b.Page(proto.TargetCreateTarget{})
+	if err != nil {
+		return nil, fmt.Errorf("创建页面失败: %v", err)
+	}
 	defer page.Close()
 
 	page = page.Timeout(30 * time.Second)

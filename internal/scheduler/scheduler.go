@@ -281,6 +281,44 @@ func (s *Scheduler) CancelTask(taskID uint) error {
 	if err != nil {
 		return err
 	}
+
+	// 使用 asynq.Inspector 清理 Redis 队列中的 pending 任务
+	inspector := asynq.NewInspector(asynq.RedisClientOpt{
+		Addr:     s.cfg.Redis.Addr,
+		Password: s.cfg.Redis.Password,
+		DB:       s.cfg.Redis.DB,
+	})
+	defer inspector.Close()
+
+	// 遍历队列，删除属于该 taskID 的 pending 任务
+	// asynq 的任务 ID 在 Payload 中，需要逐个检查
+	pendingTasks, err := inspector.ListPendingTasks("default")
+	if err == nil {
+		for _, pt := range pendingTasks {
+			var payload ScanPayload
+			if json.Unmarshal(pt.Payload, &payload) == nil && payload.TaskID == taskID {
+				if err := inspector.DeleteTask("default", pt.ID); err != nil {
+					log.Printf("[Scheduler] Failed to delete pending task %s: %v", pt.ID, err)
+				} else {
+					log.Printf("[Scheduler] Deleted pending task %s for task_id=%d", pt.ID, taskID)
+				}
+			}
+		}
+	}
+
+	// 同时取消正在活跃处理的任务
+	activeTasks, err := inspector.ListActiveTasks("default")
+	if err == nil {
+		for _, at := range activeTasks {
+			var payload ScanPayload
+			if json.Unmarshal(at.Payload, &payload) == nil && payload.TaskID == taskID {
+				if err := inspector.CancelProcessing(at.ID); err != nil {
+					log.Printf("[Scheduler] Failed to cancel active task %s: %v", at.ID, err)
+				}
+			}
+		}
+	}
+
 	task.Status = "cancelled"
 	task.Error = "用户取消"
 	return s.store.UpdateTask(task)
@@ -358,6 +396,11 @@ func (s *Scheduler) logTask(taskID uint, stage, level, message string) {
 }
 
 func (s *Scheduler) enqueue(taskType string, payload ScanPayload, priority int) error {
+	// 检查是否在允许的扫描时间段内
+	if !s.IsAllowedScanTime() {
+		return fmt.Errorf("当前不在允许的扫描时间段内（%s-%s），任务已暂存等待下次窗口", s.cfg.Worker.AllowScanStart, s.cfg.Worker.AllowScanEnd)
+	}
+
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err

@@ -136,6 +136,11 @@ func DownloadNuclei() (string, error) {
 	// 清理 zip
 	os.Remove(zipPath)
 
+	// Linux/macOS 设置可执行权限
+	if runtime.GOOS != "windows" {
+		os.Chmod(targetPath, 0755)
+	}
+
 	// 验证
 	if _, err := os.Stat(targetPath); err != nil {
 		// 尝试在子目录中查找

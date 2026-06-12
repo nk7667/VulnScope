@@ -1,41 +1,47 @@
 # VulnScope 配置文件示例
 # 复制为 config.yaml 后根据实际环境修改
 
-# 运行模式: server / worker / all
-mode: all
+mode: all  # 运行模式: server / worker / all
 
-# HTTP API 服务配置
 server:
-  addr: ":8088"
+  addr: ":8080"
+  api_key: ""                # API Key 认证，为空则不启用，建议设置
+  allowed_origins: ""        # CORS 允许的来源，如 "http://localhost:3000"，为空则不允许跨域
 
-# 数据库配置
 database:
-  driver: mysql
-  dsn: "scanner:scanner123@tcp(127.0.0.1:3306)/scanner?charset=utf8mb4&parseTime=True&loc=Local"
+  driver: mysql              # 支持: mysql / postgres / sqlite
+  dsn: "user:password@tcp(127.0.0.1:3306)/vulnscope?charset=utf8mb4&parseTime=True&loc=Local"
+  # PostgreSQL 示例: "host=127.0.0.1 user=vulnscope password=yourpassword dbname=vulnscope sslmode=disable"
+  # SQLite 示例: "vulnscope.db"
+  # 注意：请勿使用弱密码，建议通过环境变量 SCANNER_DB_DSN 设置
 
-# Redis 配置 (Asynq 任务队列)
 redis:
   addr: "127.0.0.1:6379"
-  password: ""
+  password: ""               # 建议通过环境变量 SCANNER_REDIS_PASSWORD 设置
   db: 0
 
-# Worker 配置
 worker:
-  concurrency: 10
-  scanner_concurrency:
-    domain: 5
-    alive: 10
-    port: 5
-    finger: 5
-    vuln: 3
-  max_retry: 3
-  retry_delay_sec: 60
+  concurrency: 10            # Worker 并发数
+  max_retry: 3               # 任务最大重试次数
+  retry_delay_sec: 60        # 重试间隔（秒）
+  allow_scan_start: ""       # 允许扫描的开始时间，如 "08:00"，为空则不限制
+  allow_scan_end: ""         # 允许扫描的结束时间，如 "20:00"，为空则不限制
+  exclude_targets: []        # 全局排除目标（IP/域名/CIDR/通配符），如 ["192.168.0.0/16", "*.internal.com"]
+  exclude_ports: []          # 全局排除端口，如 [161, 162]
+  ip_scan_cooldown_min: 0    # IP 扫描冷却时间（分钟），0 表示不限制
 
-# 扫描器配置
 scanner:
-  nmap_path: nmap
-  nuclei_path: nuclei
-  nuclei_templates: ""
-  alive_timeout: 60
-  finger_timeout: 1200
-  vuln_timeout: 1200
+  nmap_path: "nmap"          # nmap 可执行文件路径，为空则自动查找
+  nuclei_path: "nuclei"      # nuclei 可执行文件路径，为空则自动查找
+  nuclei_templates: ""       # nuclei 模板目录路径，为空则使用默认路径
+  nuclei_concurrency: 25     # nuclei 模板并发数
+  nuclei_bulk_size: 25       # nuclei 批量大小
+  nuclei_timeout: 10         # nuclei 单个请求超时（秒）
+  subdomain_wordlist: ""     # 子域名爆破字典文件路径
+  chrome_path: ""            # Chrome/Chromium 可执行文件路径，为空则自动查找
+  interactsh_server: ""      # OAST 反连服务器地址（如 interact.sh），为空则使用默认
+  interactsh_token: ""       # OAST 反连服务器认证 token
+  alive_timeout: 60          # 存活探测超时（秒）
+  finger_timeout: 1200       # 指纹识别超时（秒）
+  vuln_timeout: 1200         # 漏洞扫描超时（秒）
+  insecure_tls: false        # 仅在明确需要时设为 true，跳过 TLS 证书验证

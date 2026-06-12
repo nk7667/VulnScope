@@ -24,19 +24,24 @@ type TargetServiceInfo struct {
 }
 
 // nucleiJSONResult nuclei JSON 输出结构
+// nuclei 实际输出格式: {"template-id":"...", "info":{"name":"...", "severity":"..."}, ...}
 type nucleiJSONResult struct {
-	TemplateID      string   `json:"template-id"`
-	TemplateName    string   `json:"info.name"`
-	TemplatePath    string   `json:"template-path"`
-	Type            string   `json:"type"`
-	Host            string   `json:"host"`
-	Matched         string   `json:"matched-at"`
-	Severity        string   `json:"info.severity"`
-	Request         string   `json:"request"`
-	Response        string   `json:"response"`
+	TemplateID       string   `json:"template-id"`
+	TemplateName     string   `json:"-"` // 从 Info.Name 提取
+	TemplatePath     string   `json:"template-path"`
+	Type             string   `json:"type"`
+	Host             string   `json:"host"`
+	Matched          string   `json:"matched-at"`
+	Severity         string   `json:"-"` // 从 Info.Severity 提取
+	Request          string   `json:"request"`
+	Response         string   `json:"response"`
 	ExtractedResults []string `json:"extracted-results"`
-	Remediation     string   `json:"info.remediation"`
-	CURLCommand     string   `json:"curl-command"`
+	CURLCommand      string   `json:"curl-command"`
+	Info             struct {
+		Name        string `json:"name"`
+		Severity    string `json:"severity"`
+		Remediation string `json:"remediation"`
+	} `json:"info"`
 }
 
 // VulnScan 使用 Nuclei 进行漏洞扫描（全量模板，仅作兜底）
@@ -76,7 +81,7 @@ func VulnScanWithTemplates(ctx context.Context, targets []string, templatePaths 
 	// 构建命令参数
 	args := []string{
 		"-l", tmpFile.Name(),
-		"-json",
+		"-j",
 		"-silent",
 		"-c", fmt.Sprintf("%d", cfg.Scanner.NucleiConcurrency),
 		"-bs", fmt.Sprintf("%d", cfg.Scanner.NucleiBulkSize),
@@ -107,7 +112,7 @@ func VulnScanWithTemplates(ctx context.Context, targets []string, templatePaths 
 
 	// 禁用 TLS 验证
 	if cfg.Scanner.InsecureTLS {
-		args = append(args, "-system-resolvers")
+		args = append(args, "-insecure-skip-tls-verify")
 	}
 
 	// 设置扫描超时
@@ -169,11 +174,13 @@ func VulnScanWithTemplates(ctx context.Context, targets []string, templatePaths 
 		}
 
 		// 跳过空名称的结果
-		if result.TemplateName == "" && result.TemplateID == "" {
+		templateName := result.Info.Name
+		severity := result.Info.Severity
+		if templateName == "" && result.TemplateID == "" {
 			continue
 		}
 
-		name := result.TemplateName
+		name := templateName
 		if name == "" {
 			name = result.TemplateID
 		}
@@ -186,14 +193,14 @@ func VulnScanWithTemplates(ctx context.Context, targets []string, templatePaths 
 
 		vuln := model.Vuln{
 			Name:        name,
-			Severity:    result.Severity,
+			Severity:    severity,
 			Type:        result.Type,
 			TemplateID:  result.TemplateID,
 			URL:         matchedURL,
 			Request:     result.Request,
 			Response:    result.Response,
 			Evidence:    evidence,
-			Remediation: result.Remediation,
+			Remediation: result.Info.Remediation,
 			Status:      0,
 		}
 		vulns = append(vulns, vuln)
