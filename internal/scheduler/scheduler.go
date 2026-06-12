@@ -36,24 +36,27 @@ type ScanPayload struct {
 
 // Scheduler 负责任务创建与入队（唯一入队入口）
 type Scheduler struct {
-	client *asynq.Client
-	store  *store.Store
-	cfg    *config.Config
-	rdb    *redis.Client // Redis 客户端，用于标记取消任务
+	client    *asynq.Client
+	inspector *asynq.Inspector // 复用 Inspector，避免每次入队新建
+	store     *store.Store
+	cfg       *config.Config
+	rdb       *redis.Client // Redis 客户端，用于标记取消任务
 }
 
 func New(redisCfg *config.RedisConfig, s *store.Store, cfg *config.Config) *Scheduler {
-	client := asynq.NewClient(asynq.RedisClientOpt{
+	redisOpt := asynq.RedisClientOpt{
 		Addr:     redisCfg.Addr,
 		Password: redisCfg.Password,
 		DB:       redisCfg.DB,
-	})
+	}
+	client := asynq.NewClient(redisOpt)
+	inspector := asynq.NewInspector(redisOpt)
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     redisCfg.Addr,
 		Password: redisCfg.Password,
 		DB:       redisCfg.DB,
 	})
-	return &Scheduler{client: client, store: s, cfg: cfg, rdb: rdb}
+	return &Scheduler{client: client, inspector: inspector, store: s, cfg: cfg, rdb: rdb}
 }
 
 // markTaskCancelledRedis 在 Redis Set 中标记任务已取消
@@ -408,21 +411,22 @@ func (s *Scheduler) enqueue(taskType string, payload ScanPayload, priority int) 
 
 	// 队列过载保护：检查目标队列 pending 数量
 	const taskOverloadLimit = 10000
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{
-		Addr:     s.cfg.Redis.Addr,
-		Password: s.cfg.Redis.Password,
-		DB:       s.cfg.Redis.DB,
-	})
-	info, inspectErr := inspector.GetQueueInfo(queueName)
-	inspector.Close()
-	if inspectErr == nil && info.Pending > taskOverloadLimit {
-		log.Printf("[Scheduler] Queue %s overload (%d pending > %d), delaying task, task_id=%d",
-			queueName, info.Pending, taskOverloadLimit, payload.TaskID)
-		// 延迟 5 分钟后重试
-		go func() {
-			time.Sleep(5 * time.Minute)
-			s.enqueue(taskType, payload, priority)
-		}()
+	queueInfo, inspectErr := s.inspector.GetQueueInfo(queueName)
+	if inspectErr == nil && queueInfo.Pending > taskOverloadLimit {
+		log.Printf("[Scheduler] Queue %s overload (%d pending > %d), delaying task 5min, task_id=%d",
+			queueName, queueInfo.Pending, taskOverloadLimit, payload.TaskID)
+		// 使用 ProcessIn 延迟入队，避免 goroutine 泄漏
+		delayOpts := []asynq.Option{
+			asynq.Queue(queueName),
+			asynq.MaxRetry(s.cfg.Worker.MaxRetry),
+			asynq.ProcessIn(5 * time.Minute),
+		}
+		task := asynq.NewTask(taskType, data, delayOpts...)
+		taskInfo, err := s.client.Enqueue(task)
+		if err != nil {
+			return err
+		}
+		log.Printf("[Scheduler] Enqueued delayed %s (overload), task_id=%d, asynq_id=%s", taskType, payload.TaskID, taskInfo.ID)
 		return nil
 	}
 
