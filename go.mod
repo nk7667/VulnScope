@@ -5,10 +5,12 @@ go 1.25.0
 require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/glebarez/sqlite v1.11.0
+	github.com/go-redis/redis/v8 v8.11.5
 	github.com/go-rod/rod v0.116.2
 	github.com/hibiken/asynq v0.26.0
 	github.com/knqyf263/go-cpe v0.0.0-20230627041855-cb0794d06872
 	github.com/ysmood/gson v0.7.3
+	golang.org/x/time v0.15.0
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/driver/postgres v1.6.0
@@ -70,7 +72,6 @@ require (
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
-	golang.org/x/time v0.14.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	modernc.org/libc v1.22.5 // indirect
 	modernc.org/mathutil v1.5.0 // indirect

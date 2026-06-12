@@ -317,16 +317,25 @@ func (s *Store) ListFingers(assetID uint) ([]model.Finger, error) {
 // ========== Vuln ==========
 
 func (s *Store) CreateVuln(v *model.Vuln) error {
-	// 去重：同一任务+同一模板+同一URL 不重复插入
+	// 计算去重哈希
+	v.ComputeVulnHash()
+
+	// 基于 VulnHash 去重：同一 URL + 同一模板只记录一次
 	var existing model.Vuln
-	err := s.DB.Where("task_id = ? AND template_id = ? AND url = ?", v.TaskID, v.TemplateID, v.URL).First(&existing).Error
+	err := s.DB.Where("vuln_hash = ?", v.VulnHash).First(&existing).Error
 	if err == nil {
-		// 已存在，更新严重级别和证据
+		// 已存在，更新严重级别和证据（保留最新结果）
 		if v.Severity != "" {
 			existing.Severity = v.Severity
 		}
 		if v.Evidence != "" {
 			existing.Evidence = v.Evidence
+		}
+		if v.Name != "" {
+			existing.Name = v.Name
+		}
+		if v.Remediation != "" {
+			existing.Remediation = v.Remediation
 		}
 		return s.DB.Save(&existing).Error
 	}
@@ -334,6 +343,9 @@ func (s *Store) CreateVuln(v *model.Vuln) error {
 }
 
 func (s *Store) CreateVulns(vulns []model.Vuln) error {
+	for i := range vulns {
+		vulns[i].ComputeVulnHash()
+	}
 	return s.DB.Create(&vulns).Error
 }
 

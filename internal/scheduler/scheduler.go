@@ -4,6 +4,7 @@ import (
 	"vulnscope/internal/config"
 	"vulnscope/internal/model"
 	"vulnscope/internal/store"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/hibiken/asynq"
 )
 
@@ -37,6 +39,7 @@ type Scheduler struct {
 	client *asynq.Client
 	store  *store.Store
 	cfg    *config.Config
+	rdb    *redis.Client // Redis 客户端，用于标记取消任务
 }
 
 func New(redisCfg *config.RedisConfig, s *store.Store, cfg *config.Config) *Scheduler {
@@ -45,7 +48,18 @@ func New(redisCfg *config.RedisConfig, s *store.Store, cfg *config.Config) *Sche
 		Password: redisCfg.Password,
 		DB:       redisCfg.DB,
 	})
-	return &Scheduler{client: client, store: s, cfg: cfg}
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     redisCfg.Addr,
+		Password: redisCfg.Password,
+		DB:       redisCfg.DB,
+	})
+	return &Scheduler{client: client, store: s, cfg: cfg, rdb: rdb}
+}
+
+// markTaskCancelledRedis 在 Redis Set 中标记任务已取消
+func (s *Scheduler) markTaskCancelledRedis(taskID uint) {
+	ctx := context.Background()
+	s.rdb.SAdd(ctx, "vulnscope:cancelled_tasks", taskID)
 }
 
 // EnqueueTask 将扫描任务按流水线入队
@@ -297,6 +311,10 @@ func (s *Scheduler) CancelTask(taskID uint) error {
 
 	task.Status = "cancelled"
 	task.Error = "用户取消"
+
+	// 同步标记 Redis Set，让 Worker 毫秒级感知取消
+	s.markTaskCancelledRedis(taskID)
+
 	return s.store.UpdateTask(task)
 }
 
@@ -388,6 +406,26 @@ func (s *Scheduler) enqueue(taskType string, payload ScanPayload, priority int) 
 		queueName = "low"
 	}
 
+	// 队列过载保护：检查目标队列 pending 数量
+	const taskOverloadLimit = 10000
+	inspector := asynq.NewInspector(asynq.RedisClientOpt{
+		Addr:     s.cfg.Redis.Addr,
+		Password: s.cfg.Redis.Password,
+		DB:       s.cfg.Redis.DB,
+	})
+	info, inspectErr := inspector.GetQueueInfo(queueName)
+	inspector.Close()
+	if inspectErr == nil && info.Pending > taskOverloadLimit {
+		log.Printf("[Scheduler] Queue %s overload (%d pending > %d), delaying task, task_id=%d",
+			queueName, info.Pending, taskOverloadLimit, payload.TaskID)
+		// 延迟 5 分钟后重试
+		go func() {
+			time.Sleep(5 * time.Minute)
+			s.enqueue(taskType, payload, priority)
+		}()
+		return nil
+	}
+
 	// 构建任务选项
 	opts := []asynq.Option{
 		asynq.Queue(queueName),
@@ -405,7 +443,7 @@ func (s *Scheduler) enqueue(taskType string, payload ScanPayload, priority int) 
 	}
 
 	task := asynq.NewTask(taskType, data, opts...)
-	info, err := s.client.Enqueue(task)
+	taskInfo, err := s.client.Enqueue(task)
 	if err != nil {
 		return err
 	}
@@ -416,7 +454,7 @@ func (s *Scheduler) enqueue(taskType string, payload ScanPayload, priority int) 
 				s.cfg.Worker.AllowScanStart, s.cfg.Worker.AllowScanEnd, s.nextScanWindowDelay()))
 	}
 
-	log.Printf("[Scheduler] Enqueued %s, task_id=%d, asynq_id=%s, queue=%s", taskType, payload.TaskID, info.ID, queueName)
+	log.Printf("[Scheduler] Enqueued %s, task_id=%d, asynq_id=%s, queue=%s", taskType, payload.TaskID, taskInfo.ID, queueName)
 	return nil
 }
 

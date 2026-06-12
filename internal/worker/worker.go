@@ -14,9 +14,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/hibiken/asynq"
+	"golang.org/x/time/rate"
 )
 
 // EnqueueFunc 入队回调函数类型，由 Scheduler 提供
@@ -29,6 +32,11 @@ type Worker struct {
 	store    *store.Store
 	cfg      *config.Config
 	enqueue  EnqueueFunc // 通过回调入队下一阶段
+	rdb      *redis.Client // Redis 客户端，用于快速检查任务状态
+
+	// 每目标 QPS 限速
+	targetLimiters   map[string]*rate.Limiter
+	targetLimitersMu sync.Mutex
 }
 
 func New(redisCfg *config.RedisConfig, s *store.Store, cfg *config.Config, enqueueFn EnqueueFunc) *Worker {
@@ -50,12 +58,21 @@ func New(redisCfg *config.RedisConfig, s *store.Store, cfg *config.Config, enque
 		RetryDelayFunc: asynq.DefaultRetryDelayFunc,
 	})
 
+	// 初始化 Redis 客户端（复用 asynq 的 Redis 配置）
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     redisCfg.Addr,
+		Password: redisCfg.Password,
+		DB:       redisCfg.DB,
+	})
+
 	w := &Worker{
-		mux:     mux,
-		srv:     srv,
-		store:   s,
-		cfg:     cfg,
-		enqueue: enqueueFn,
+		mux:            mux,
+		srv:            srv,
+		store:          s,
+		cfg:            cfg,
+		enqueue:        enqueueFn,
+		rdb:            rdb,
+		targetLimiters: make(map[string]*rate.Limiter),
 	}
 
 	// 注册任务处理器
@@ -77,13 +94,77 @@ func (w *Worker) Shutdown() {
 	w.srv.Shutdown()
 }
 
-// isTaskCancelled 检查任务是否已取消或暂停
+// isTaskCancelled 检查任务是否已取消或暂停（优先使用 Redis Set，回退到数据库）
 func (w *Worker) isTaskCancelled(taskID uint) bool {
+	// 优先检查 Redis Set（毫秒级响应）
+	ctx := context.Background()
+	key := fmt.Sprintf("vulnscope:cancelled_tasks")
+	isMember, err := w.rdb.SIsMember(ctx, key, taskID).Result()
+	if err == nil {
+		return isMember
+	}
+	// Redis 不可用时回退到数据库
 	task, err := w.store.GetTask(taskID)
 	if err != nil {
 		return true
 	}
 	return task.Status == "cancelled" || task.Status == "paused"
+}
+
+// markTaskCancelled 在 Redis 中标记任务已取消（由 Scheduler 的 CancelTask 调用）
+func (w *Worker) markTaskCancelled(taskID uint) {
+	ctx := context.Background()
+	w.rdb.SAdd(ctx, "vulnscope:cancelled_tasks", taskID)
+}
+
+// getTargetLimiter 获取目标的 QPS 限速器（每目标默认 10 QPS）
+func (w *Worker) getTargetLimiter(target string) *rate.Limiter {
+	host := target
+	if h, _, err := net.SplitHostPort(target); err == nil && h != "" {
+		host = h
+	}
+
+	w.targetLimitersMu.Lock()
+	defer w.targetLimitersMu.Unlock()
+
+	if limiter, ok := w.targetLimiters[host]; ok {
+		return limiter
+	}
+
+	// 默认每目标 10 QPS，burst 20
+	qps := 10
+	if w.cfg.Worker.Concurrency > 0 {
+		qps = w.cfg.Worker.Concurrency
+	}
+	limiter := rate.NewLimiter(rate.Limit(qps), qps*2)
+	w.targetLimiters[host] = limiter
+	return limiter
+}
+
+// waitTargetLimit 等待目标 QPS 限速许可
+func (w *Worker) waitTargetLimit(ctx context.Context, target string) error {
+	limiter := w.getTargetLimiter(target)
+	return limiter.Wait(ctx)
+}
+
+// skipRetry 返回 asynq.SkipRetry 错误，避免无意义的重试
+var skipRetry = fmt.Errorf("skip retry: %w", asynq.SkipRetry)
+
+// cancelHandler 包装 handler 逻辑，在 goroutine 中执行实际工作，
+// 主线程监听 ctx.Done，超时/取消时返回 SkipRetry
+func (w *Worker) cancelHandler(ctx context.Context, handler func() error) error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- handler()
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		log.Printf("[Worker] Task cancelled by context: %v", ctx.Err())
+		return skipRetry
+	}
 }
 
 // isExcluded 检查目标是否在排除列表中
@@ -177,6 +258,12 @@ func (w *Worker) filterTargets(targets []string) []string {
 }
 
 func (w *Worker) handleDomainScan(ctx context.Context, t *asynq.Task) error {
+	return w.cancelHandler(ctx, func() error {
+		return w.doDomainScan(ctx, t)
+	})
+}
+
+func (w *Worker) doDomainScan(ctx context.Context, t *asynq.Task) error {
 	var p scheduler.ScanPayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return err
@@ -236,6 +323,12 @@ func (w *Worker) handleDomainScan(ctx context.Context, t *asynq.Task) error {
 }
 
 func (w *Worker) handleAliveScan(ctx context.Context, t *asynq.Task) error {
+	return w.cancelHandler(ctx, func() error {
+		return w.doAliveScan(ctx, t)
+	})
+}
+
+func (w *Worker) doAliveScan(ctx context.Context, t *asynq.Task) error {
 	var p scheduler.ScanPayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return err
@@ -255,6 +348,13 @@ func (w *Worker) handleAliveScan(ctx context.Context, t *asynq.Task) error {
 	}
 
 	w.logTask(p.TaskID, "alive", "info", fmt.Sprintf("开始存活探测，目标数: %d", len(p.Targets)))
+
+	// 每目标 QPS 限速
+	for _, target := range p.Targets {
+		if err := w.waitTargetLimit(ctx, target); err != nil {
+			return skipRetry
+		}
+	}
 
 	results, err := scanner.AliveScan(ctx, p.Targets, w.cfg)
 	if err != nil {
@@ -296,6 +396,12 @@ func (w *Worker) handleAliveScan(ctx context.Context, t *asynq.Task) error {
 }
 
 func (w *Worker) handlePortScan(ctx context.Context, t *asynq.Task) error {
+	return w.cancelHandler(ctx, func() error {
+		return w.doPortScan(ctx, t)
+	})
+}
+
+func (w *Worker) doPortScan(ctx context.Context, t *asynq.Task) error {
 	var p scheduler.ScanPayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return err
@@ -315,6 +421,13 @@ func (w *Worker) handlePortScan(ctx context.Context, t *asynq.Task) error {
 	}
 
 	w.logTask(p.TaskID, "port", "info", fmt.Sprintf("开始端口扫描，目标数: %d", len(p.Targets)))
+
+	// 每目标 QPS 限速
+	for _, target := range p.Targets {
+		if err := w.waitTargetLimit(ctx, target); err != nil {
+			return skipRetry
+		}
+	}
 
 	// 分离已带端口的目标和需要扫描的目标
 	var targetsWithPort []string
@@ -390,6 +503,16 @@ func (w *Worker) handlePortScan(ctx context.Context, t *asynq.Task) error {
 		return w.store.UpdateTask(task)
 	}
 
+	// 开放端口过多保护：截断为前 30 个端口，避免指纹扫描爆炸
+	const maxPortsPerTarget = 30
+	if len(nextTargets) > maxPortsPerTarget {
+		log.Printf("[Worker] Too many open ports (%d), truncating to %d, task_id=%d",
+			len(nextTargets), maxPortsPerTarget, p.TaskID)
+		w.logTask(p.TaskID, "port", "warn",
+			fmt.Sprintf("开放端口过多（%d），截断为前 %d 个以避免扫描爆炸", len(nextTargets), maxPortsPerTarget))
+		nextTargets = nextTargets[:maxPortsPerTarget]
+	}
+
 	log.Printf("[Worker] Port scan found %d open ports, passing to next stage: %v", len(nextTargets), nextTargets)
 	w.logTask(p.TaskID, "port", "info", fmt.Sprintf("端口扫描完成，发现 %d 个开放端口", len(nextTargets)))
 	w.markStageCompleted(p.TaskID, "port")
@@ -402,6 +525,12 @@ func (w *Worker) handlePortScan(ctx context.Context, t *asynq.Task) error {
 }
 
 func (w *Worker) handleFingerScan(ctx context.Context, t *asynq.Task) error {
+	return w.cancelHandler(ctx, func() error {
+		return w.doFingerScan(ctx, t)
+	})
+}
+
+func (w *Worker) doFingerScan(ctx context.Context, t *asynq.Task) error {
 	var p scheduler.ScanPayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return err
@@ -421,6 +550,13 @@ func (w *Worker) handleFingerScan(ctx context.Context, t *asynq.Task) error {
 	}
 
 	w.logTask(p.TaskID, "finger", "info", fmt.Sprintf("开始指纹识别，目标数: %d", len(p.Targets)))
+
+	// 每目标 QPS 限速
+	for _, target := range p.Targets {
+		if err := w.waitTargetLimit(ctx, target); err != nil {
+			return skipRetry
+		}
+	}
 
 	results, err := scanner.FingerScan(ctx, p.Targets, w.cfg)
 	if err != nil {
@@ -511,6 +647,12 @@ func (w *Worker) handleFingerScan(ctx context.Context, t *asynq.Task) error {
 }
 
 func (w *Worker) handleVulnScan(ctx context.Context, t *asynq.Task) error {
+	return w.cancelHandler(ctx, func() error {
+		return w.doVulnScan(ctx, t)
+	})
+}
+
+func (w *Worker) doVulnScan(ctx context.Context, t *asynq.Task) error {
 	var p scheduler.ScanPayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return err
@@ -530,6 +672,13 @@ func (w *Worker) handleVulnScan(ctx context.Context, t *asynq.Task) error {
 	}
 
 	w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("开始漏洞扫描，目标数: %d", len(p.Targets)))
+
+	// 每目标 QPS 限速
+	for _, target := range p.Targets {
+		if err := w.waitTargetLimit(ctx, target); err != nil {
+			return skipRetry
+		}
+	}
 
 	// 复测任务：使用指定模板直接扫描
 	if p.IsRetest && len(p.TemplateIDs) > 0 {

@@ -1,6 +1,10 @@
 package model
 
-import "time"
+import (
+	"crypto/md5"
+	"fmt"
+	"time"
+)
 
 // Target 扫描目标 - 用户手动添加
 type Target struct {
@@ -85,21 +89,28 @@ type Finger struct {
 
 // Vuln 漏洞信息
 type Vuln struct {
-	ID         uint      `gorm:"primaryKey" json:"id"`
-	AssetID    uint      `gorm:"index" json:"asset_id"`
-	TaskID     uint      `gorm:"index;not null" json:"task_id"`
-	Name       string    `gorm:"not null" json:"name"`        // 漏洞名称
-	Severity   string    `json:"severity"`                    // critical/high/medium/low/info
-	Type       string    `json:"type"`                        // 漏洞类型
-	TemplateID string    `json:"template_id"`                 // Nuclei模板ID
-	Request    string    `json:"request"`                     // 请求证据
-	Response   string    `json:"response"`                    // 响应证据
-	Evidence   string    `json:"evidence"`                    // 其他证据
-	Remediation string   `json:"remediation"`                 // 修复建议
-	Status     int       `gorm:"default:0" json:"status"`     // 0:未确认, 1:误报, 2:确认, 3:忽略
-	URL        string    `json:"url"`                         // 漏洞URL
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID          uint      `gorm:"primaryKey" json:"id"`
+	AssetID     uint      `gorm:"index" json:"asset_id"`
+	TaskID      uint      `gorm:"index;not null" json:"task_id"`
+	Name        string    `gorm:"not null" json:"name"`        // 漏洞名称
+	Severity    string    `json:"severity"`                    // critical/high/medium/low/info
+	Type        string    `json:"type"`                        // 漏洞类型
+	TemplateID  string    `json:"template_id"`                 // Nuclei模板ID
+	VulnHash    string    `gorm:"type:varchar(32);uniqueIndex:idx_vuln_hash" json:"-"` // 去重哈希 MD5(domain:ip:port:templateID)
+	Request     string    `json:"request"`                     // 请求证据
+	Response    string    `json:"response"`                    // 响应证据
+	Evidence    string    `json:"evidence"`                    // 其他证据
+	Remediation string    `json:"remediation"`                 // 修复建议
+	Status      int       `gorm:"default:0" json:"status"`     // 0:未确认, 1:误报, 2:确认, 3:忽略
+	URL         string    `json:"url"`                         // 漏洞URL
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// ComputeVulnHash 计算漏洞去重哈希：MD5(url:templateID)
+func (v *Vuln) ComputeVulnHash() {
+	key := fmt.Sprintf("%s:%s", v.URL, v.TemplateID)
+	v.VulnHash = fmt.Sprintf("%x", md5.Sum([]byte(key)))
 }
 
 // Template Nuclei模板

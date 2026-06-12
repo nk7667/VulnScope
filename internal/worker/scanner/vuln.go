@@ -3,6 +3,7 @@ package scanner
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -14,7 +15,19 @@ import (
 
 	"vulnscope/internal/config"
 	"vulnscope/internal/model"
+	"unicode/utf8"
 )
+
+// sanitizeField 检查字符串是否为有效 UTF-8，非 UTF-8 数据用 base64 编码
+func sanitizeField(s string) string {
+	if s == "" {
+		return ""
+	}
+	if utf8.ValidString(s) {
+		return s
+	}
+	return "base64:" + base64.StdEncoding.EncodeToString([]byte(s))
+}
 
 // TargetServiceInfo 目标服务信息
 type TargetServiceInfo struct {
@@ -199,8 +212,8 @@ func VulnScanWithTemplates(ctx context.Context, targets []string, templatePaths 
 			Type:        result.Type,
 			TemplateID:  result.TemplateID,
 			URL:         matchedURL,
-			Request:     result.Request,
-			Response:    result.Response,
+			Request:     sanitizeField(result.Request),
+			Response:    sanitizeField(result.Response),
 			Evidence:    evidence,
 			Remediation: result.Info.Remediation,
 			Status:      0,
@@ -314,8 +327,8 @@ func runNucleiCmd(ctx context.Context, nucleiPath string, args []string) ([]mode
 			Type:        result.Type,
 			TemplateID:  result.TemplateID,
 			URL:         matchedURL,
-			Request:     result.Request,
-			Response:    result.Response,
+			Request:     sanitizeField(result.Request),
+			Response:    sanitizeField(result.Response),
 			Evidence:    evidence,
 			Remediation: result.Info.Remediation,
 			Status:      0,
