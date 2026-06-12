@@ -274,7 +274,7 @@ func extractTitle(resp *http.Response) string {
 	start := strings.Index(lower, "<title>")
 	end := strings.Index(lower, "</title>")
 	if start != -1 && end != -1 && end > start {
-		return string(body[start+7 : end])
+		return lower[start+7 : end]
 	}
 	return ""
 }

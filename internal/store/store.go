@@ -412,7 +412,7 @@ func (s *Store) DeleteTemplate(id uint) error {
 }
 
 func (s *Store) ClearTemplates() error {
-	return s.DB.Exec("DELETE FROM templates").Error
+	return s.DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&model.Template{}).Error
 }
 
 func (s *Store) UpsertTemplate(t *model.Template) error {
