@@ -27,12 +27,10 @@ type TargetServiceInfo struct {
 // nuclei 实际输出格式: {"template-id":"...", "info":{"name":"...", "severity":"..."}, ...}
 type nucleiJSONResult struct {
 	TemplateID       string   `json:"template-id"`
-	TemplateName     string   `json:"-"` // 从 Info.Name 提取
 	TemplatePath     string   `json:"template-path"`
 	Type             string   `json:"type"`
 	Host             string   `json:"host"`
 	Matched          string   `json:"matched-at"`
-	Severity         string   `json:"-"` // 从 Info.Severity 提取
 	Request          string   `json:"request"`
 	Response         string   `json:"response"`
 	ExtractedResults []string `json:"extracted-results"`

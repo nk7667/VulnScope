@@ -290,30 +290,34 @@ func (s *Scheduler) CancelTask(taskID uint) error {
 	})
 	defer inspector.Close()
 
-	// 遍历队列，删除属于该 taskID 的 pending 任务
-	// asynq 的任务 ID 在 Payload 中，需要逐个检查
-	pendingTasks, err := inspector.ListPendingTasks("default")
-	if err == nil {
-		for _, pt := range pendingTasks {
-			var payload ScanPayload
-			if json.Unmarshal(pt.Payload, &payload) == nil && payload.TaskID == taskID {
-				if err := inspector.DeleteTask("default", pt.ID); err != nil {
-					log.Printf("[Scheduler] Failed to delete pending task %s: %v", pt.ID, err)
-				} else {
-					log.Printf("[Scheduler] Deleted pending task %s for task_id=%d", pt.ID, taskID)
+	// 遍历所有优先级队列
+	queues := []string{"retest", "high", "default", "low"}
+
+	for _, queue := range queues {
+		// 删除 pending 任务
+		pendingTasks, err := inspector.ListPendingTasks(queue)
+		if err == nil {
+			for _, pt := range pendingTasks {
+				var payload ScanPayload
+				if json.Unmarshal(pt.Payload, &payload) == nil && payload.TaskID == taskID {
+					if err := inspector.DeleteTask(queue, pt.ID); err != nil {
+						log.Printf("[Scheduler] Failed to delete pending task %s from %s: %v", pt.ID, queue, err)
+					} else {
+						log.Printf("[Scheduler] Deleted pending task %s from %s for task_id=%d", pt.ID, queue, taskID)
+					}
 				}
 			}
 		}
-	}
 
-	// 同时取消正在活跃处理的任务
-	activeTasks, err := inspector.ListActiveTasks("default")
-	if err == nil {
-		for _, at := range activeTasks {
-			var payload ScanPayload
-			if json.Unmarshal(at.Payload, &payload) == nil && payload.TaskID == taskID {
-				if err := inspector.CancelProcessing(at.ID); err != nil {
-					log.Printf("[Scheduler] Failed to cancel active task %s: %v", at.ID, err)
+		// 取消正在活跃处理的任务
+		activeTasks, err := inspector.ListActiveTasks(queue)
+		if err == nil {
+			for _, at := range activeTasks {
+				var payload ScanPayload
+				if json.Unmarshal(at.Payload, &payload) == nil && payload.TaskID == taskID {
+					if err := inspector.CancelProcessing(at.ID); err != nil {
+						log.Printf("[Scheduler] Failed to cancel active task %s from %s: %v", at.ID, queue, err)
+					}
 				}
 			}
 		}
@@ -396,22 +400,80 @@ func (s *Scheduler) logTask(taskID uint, stage, level, message string) {
 }
 
 func (s *Scheduler) enqueue(taskType string, payload ScanPayload, priority int) error {
-	// 检查是否在允许的扫描时间段内
-	if !s.IsAllowedScanTime() {
-		return fmt.Errorf("当前不在允许的扫描时间段内（%s-%s），任务已暂存等待下次窗口", s.cfg.Worker.AllowScanStart, s.cfg.Worker.AllowScanEnd)
-	}
-
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	task := asynq.NewTask(taskType, data, asynq.Queue("default"), asynq.MaxRetry(s.cfg.Worker.MaxRetry))
+
+	// 确定目标队列
+	queueName := "default"
+	switch {
+	case payload.IsRetest:
+		queueName = "retest"
+	case priority >= 8:
+		queueName = "high"
+	case priority <= 2:
+		queueName = "low"
+	}
+
+	// 构建任务选项
+	opts := []asynq.Option{
+		asynq.Queue(queueName),
+		asynq.MaxRetry(s.cfg.Worker.MaxRetry),
+	}
+
+	// 不在允许的扫描时间段内，设置延迟执行到下一个时间窗口
+	if !s.IsAllowedScanTime() {
+		delay := s.nextScanWindowDelay()
+		opts = append(opts, asynq.ProcessIn(delay))
+		log.Printf("[Scheduler] 当前不在扫描时间段（%s-%s），任务将在 %v 后执行, task_id=%d",
+			s.cfg.Worker.AllowScanStart, s.cfg.Worker.AllowScanEnd, delay, payload.TaskID)
+	}
+
+	task := asynq.NewTask(taskType, data, opts...)
 	info, err := s.client.Enqueue(task)
 	if err != nil {
 		return err
 	}
-	log.Printf("[Scheduler] Enqueued %s, task_id=%d, asynq_id=%s", taskType, payload.TaskID, info.ID)
+	log.Printf("[Scheduler] Enqueued %s, task_id=%d, asynq_id=%s, queue=%s", taskType, payload.TaskID, info.ID, queueName)
 	return nil
+}
+
+// nextScanWindowDelay 计算到下一个扫描时间窗口的延迟时间
+func (s *Scheduler) nextScanWindowDelay() time.Duration {
+	if s.cfg.Worker.AllowScanStart == "" || s.cfg.Worker.AllowScanEnd == "" {
+		return 0
+	}
+
+	now := time.Now()
+	currentMin := now.Hour()*60 + now.Minute()
+	startMin, endMin := parseTimeRange(s.cfg.Worker.AllowScanStart, s.cfg.Worker.AllowScanEnd)
+
+	var delayMin int
+	if startMin <= endMin {
+		// 不跨午夜：如 08:00-20:00
+		// 当前在 20:01~23:59，等待到明天 08:00
+		// 当前在 00:00~07:59，等待到今天 08:00
+		if currentMin > endMin {
+			delayMin = (24*60 - currentMin) + startMin
+		} else {
+			delayMin = startMin - currentMin
+		}
+	} else {
+		// 跨午夜：如 22:00-06:00
+		// 当前在 06:01~21:59，等待到今天 22:00
+		if currentMin > endMin && currentMin < startMin {
+			delayMin = startMin - currentMin
+		} else {
+			// 当前在窗口内，不应该调用此函数
+			delayMin = 0
+		}
+	}
+
+	if delayMin < 1 {
+		delayMin = 1 // 最少延迟 1 分钟
+	}
+	return time.Duration(delayMin) * time.Minute
 }
 
 func (s *Scheduler) Close() error {
