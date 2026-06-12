@@ -156,7 +156,16 @@ func discoverSubdomains(ctx context.Context, domain string, cfg *config.Config) 
 		}
 	}
 
-	// 3. 子域名爆破（如果配置了字典文件）
+	// 3. TLS 证书 SAN 提取子域名
+	tlsResults := tlsCertSubdomains(domain, 443)
+	for _, sub := range tlsResults {
+		if !seen[sub] {
+			seen[sub] = true
+			subdomains = append(subdomains, sub)
+		}
+	}
+
+	// 4. 子域名爆破（如果配置了字典文件）
 	if cfg.Scanner.SubdomainWordlist != "" {
 		bruteResults := bruteSubdomains(ctx, domain, cfg.Scanner.SubdomainWordlist, cfg)
 		for _, sub := range bruteResults {

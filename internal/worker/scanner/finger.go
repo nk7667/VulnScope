@@ -50,7 +50,7 @@ func FingerScan(ctx context.Context, targets []string, cfg *config.Config) (map[
 		result.Service = inferServiceByPort(target)
 
 		// HTTP 指纹识别
-		fingers := identifyFingers(ctx, nil, target)
+		fingers := identifyFingers(ctx, nil, target, cfg.Scanner.InsecureTLS)
 		result.Fingers = fingers
 
 		// 从指纹推断 CPE
@@ -662,7 +662,7 @@ func inferCPEFromTechs(techs []string) string {
 // ========== 以下为 HTTP 指纹识别逻辑 ==========
 
 // identifyFingers HTTP 指纹识别：先用 HEAD 探测存活，再用 GET 获取指纹
-func identifyFingers(ctx context.Context, client *http.Client, target string) []model.Finger {
+func identifyFingers(ctx context.Context, client *http.Client, target string, insecureTLS bool) []model.Finger {
 	var fingers []model.Finger
 
 	host := target
@@ -676,7 +676,7 @@ func identifyFingers(ctx context.Context, client *http.Client, target string) []
 		client = &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS},
 				DialContext: (&net.Dialer{
 					Timeout: 5 * time.Second,
 				}).DialContext,

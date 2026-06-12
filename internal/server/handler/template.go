@@ -348,7 +348,16 @@ func (h *TemplateHandler) ImportRepo(c *gin.Context) {
 		return
 	}
 
-	// 检查 git 是否可用
+	// 安全校验：只允许 https:// 开头的 Git 仓库 URL
+	if !strings.HasPrefix(req.RepoURL, "https://") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "仓库 URL 必须以 https:// 开头，不支持 file://、git:// 或 SSH 协议"})
+		return
+	}
+	// 防止 URL 中包含命令注入字符
+	if strings.ContainsAny(req.RepoURL, "|&;$`\\") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "仓库 URL 包含非法字符"})
+		return
+	}
 	if _, err := exec.LookPath("git"); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "git 未安装，请先安装 git"})
 		return
@@ -399,8 +408,24 @@ func (h *TemplateHandler) ImportDir(c *gin.Context) {
 		return
 	}
 
+	// 安全校验：限制可导入的目录范围，防止路径遍历读取敏感文件
+	absPath, err := filepath.Abs(req.DirPath)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "路径格式无效"})
+		return
+	}
+	// 禁止导入系统敏感目录
+	blockedPrefixes := []string{"/etc", "/root", "/home", "/var", "/usr", "/boot", "/proc", "/sys", "/dev",
+		`C:\Windows`, `C:\Users`, `C:\Program Files`}
+	for _, prefix := range blockedPrefixes {
+		if strings.HasPrefix(absPath, prefix) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("不允许导入系统目录: %s", req.DirPath)})
+			return
+		}
+	}
+
 	// 检查目录是否存在
-	info, err := os.Stat(req.DirPath)
+	info, err := os.Stat(absPath)
 	if err != nil || !info.IsDir() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("目录不存在: %s", req.DirPath)})
 		return
@@ -411,7 +436,7 @@ func (h *TemplateHandler) ImportDir(c *gin.Context) {
 		templateType = req.Name
 	}
 
-	synced, skipped, failed := h.importFromDir(req.DirPath, templateType)
+	synced, skipped, failed := h.importFromDir(absPath, templateType)
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":  fmt.Sprintf("导入完成！入库 %d 个模板，跳过 %d 个，失败 %d 个", synced, skipped, failed),

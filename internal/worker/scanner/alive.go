@@ -107,8 +107,11 @@ func AliveScan(ctx context.Context, targets []string, cfg *config.Config) ([]Ali
 		}
 
 		if result.Alive {
-			results = append(results, result)
+			log.Printf("[AliveScan] Target %s is alive", target)
+		} else {
+			log.Printf("[AliveScan] Target %s is not alive", target)
 		}
+		results = append(results, result)
 	}
 
 	return results, nil

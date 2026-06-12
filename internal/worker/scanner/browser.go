@@ -29,43 +29,48 @@ type BrowserResult struct {
 
 var (
 	browserInstance *rod.Browser
-	browserOnce     sync.Once
+	browserMu       sync.Mutex // 保护浏览器初始化和重试
 	browserSem      = make(chan struct{}, 3) // 最多 3 个并发浏览器操作
+	browserReady    bool                     // 浏览器是否成功初始化
 )
 
-// getBrowser 获取或初始化浏览器实例（单例模式）
+// getBrowser 获取或初始化浏览器实例（支持重试）
 func getBrowser(cfg *config.Config) (*rod.Browser, error) {
-	var initErr error
-	browserOnce.Do(func() {
-		// 配置 launcher
-		l := launcher.New()
-		l = l.Headless(true)
+	browserMu.Lock()
+	defer browserMu.Unlock()
 
-		// 如果配置了 Chrome 路径
-		if cfg.Scanner.ChromePath != "" {
-			l = l.Bin(cfg.Scanner.ChromePath)
-		}
+	// 已成功初始化，直接返回
+	if browserReady && browserInstance != nil {
+		return browserInstance, nil
+	}
 
-		// 沙箱参数
-		l = l.NoSandbox(true)
+	// 配置 launcher
+	l := launcher.New()
+	l = l.Headless(true)
 
-		// 启动浏览器
-		uri, err := l.Launch()
-		if err != nil {
-			initErr = fmt.Errorf("启动 Chrome 浏览器失败: %v", err)
-			return
-		}
+	// 如果配置了 Chrome 路径
+	if cfg.Scanner.ChromePath != "" {
+		l = l.Bin(cfg.Scanner.ChromePath)
+	}
 
-		browserInstance = rod.New().ControlURL(uri)
-		if err := browserInstance.Connect(); err != nil {
-			initErr = fmt.Errorf("连接 Chrome 浏览器失败: %v", err)
-			return
-		}
+	// 沙箱参数
+	l = l.NoSandbox(true)
 
-		log.Printf("[Browser] Chrome 无头浏览器已启动")
-	})
+	// 启动浏览器
+	uri, err := l.Launch()
+	if err != nil {
+		return nil, fmt.Errorf("启动 Chrome 浏览器失败: %v", err)
+	}
 
-	return browserInstance, initErr
+	browserInstance = rod.New().ControlURL(uri)
+	if err := browserInstance.Connect(); err != nil {
+		browserInstance = nil
+		return nil, fmt.Errorf("连接 Chrome 浏览器失败: %v", err)
+	}
+
+	browserReady = true
+	log.Printf("[Browser] Chrome 无头浏览器已启动")
+	return browserInstance, nil
 }
 
 // BrowserRender 使用 Chrome 无头浏览器渲染页面
@@ -211,9 +216,12 @@ func IsBrowserAvailable(cfg *config.Config) bool {
 
 // CloseBrowser 关闭浏览器实例
 func CloseBrowser() {
+	browserMu.Lock()
+	defer browserMu.Unlock()
 	if browserInstance != nil {
 		browserInstance.Close()
 		browserInstance = nil
+		browserReady = false
 	}
 }
 
