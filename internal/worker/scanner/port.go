@@ -1,8 +1,8 @@
 package scanner
 
 import (
-	"blackbox-scanner/internal/config"
-	"blackbox-scanner/internal/model"
+	"vulnscope/internal/config"
+	"vulnscope/internal/model"
 	"context"
 	"fmt"
 	"log"
@@ -143,7 +143,7 @@ func parseNmapGrepable(output string) []model.Port {
 	return ports
 }
 
-// tcpScan Go 原生 TCP 连接扫描
+// tcpScan Go 原生 TCP 连接扫描（带速率限制）
 func tcpScan(ctx context.Context, target string, ports []int) []model.Port {
 	var result []model.Port
 	var mu sync.Mutex
@@ -152,8 +152,14 @@ func tcpScan(ctx context.Context, target string, ports []int) []model.Port {
 	// 并发控制：最多 100 个 goroutine
 	sem := make(chan struct{}, 100)
 
+	// 速率限制：每秒最多 500 次连接尝试，防止对目标造成过大压力
+	// 500/s 在 100 并发下每个 goroutine 平均 5/s，合理平衡速度和隐蔽性
+	limiter := time.NewTicker(2 * time.Millisecond) // ~500/s
+	defer limiter.Stop()
+
 	for _, port := range ports {
 		wg.Add(1)
+		<-limiter.C // 速率限制
 		sem <- struct{}{} // 获取信号量
 		go func(p int) {
 			defer wg.Done()

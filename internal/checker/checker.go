@@ -1,6 +1,8 @@
 package checker
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -73,7 +75,7 @@ func InstallDir() string {
 	// 获取可执行文件所在目录
 	exePath, err := os.Executable()
 	if err != nil {
-		dir := filepath.Join(os.Getenv("USERPROFILE"), ".blackbox-scanner", "tools")
+		dir := filepath.Join(os.Getenv("USERPROFILE"), ".vulnscope", "tools")
 		os.MkdirAll(dir, 0755)
 		return dir
 	}
@@ -112,9 +114,11 @@ func DownloadNuclei() (string, error) {
 	log.Printf("[Checker] 正在下载 nuclei: %s\n", url)
 
 	zipPath := filepath.Join(installDir, zipName)
-	if err := downloadFile(url, zipPath); err != nil {
+	hash, err := downloadFile(url, zipPath)
+	if err != nil {
 		return "", fmt.Errorf("下载 nuclei 失败: %v\n请手动下载: https://github.com/projectdiscovery/nuclei/releases", err)
 	}
+	log.Printf("[Checker] nuclei 下载完成, SHA256: %s\n", hash)
 
 	// 解压
 	log.Println("[Checker] 正在解压 nuclei...")
@@ -151,6 +155,12 @@ func DownloadNuclei() (string, error) {
 		return "", fmt.Errorf("nuclei 安装失败，请手动下载: https://github.com/projectdiscovery/nuclei/releases")
 	}
 
+	// 校验下载文件的 SHA256（对解压后的可执行文件）
+	exeHash, err := fileSHA256(targetPath)
+	if err == nil {
+		log.Printf("[Checker] nuclei 可执行文件 SHA256: %s（请与官方校验值比对）\n", exeHash)
+	}
+
 	log.Printf("[Checker] nuclei 安装成功: %s\n", targetPath)
 	return targetPath, nil
 }
@@ -172,9 +182,11 @@ func DownloadNmap() (string, error) {
 
 	log.Printf("[Checker] 正在下载 nmap 安装包: %s\n", url)
 
-	if err := downloadFile(url, installerPath); err != nil {
+	hash, err := downloadFile(url, installerPath)
+	if err != nil {
 		return "", fmt.Errorf("下载 nmap 失败: %v\n请手动下载: https://nmap.org/download.html", err)
 	}
+	log.Printf("[Checker] nmap 下载完成, SHA256: %s（请与官方校验值比对）\n", hash)
 
 	// 静默安装
 	fmt.Println("[Checker] 正在安装 nmap（静默安装）...")
@@ -236,28 +248,49 @@ func CheckAndInstall(nmapPath, nucleiPath string) (string, string, []string) {
 	return nmapPath, nucleiPath, warnings
 }
 
-func downloadFile(url, filePath string) error {
+func downloadFile(url, filePath string) (string, error) {
 	resp, err := http.Get(url)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
 	}
 
 	f, err := os.Create(filePath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 
-	// 显示下载进度
+	// 边下载边计算 SHA256
+	hasher := sha256.New()
 	counter := &writeCounter{}
-	_, err = io.Copy(f, io.TeeReader(resp.Body, counter))
+	_, err = io.Copy(f, io.TeeReader(io.TeeReader(resp.Body, hasher), counter))
 	fmt.Println() // 换行
-	return err
+	if err != nil {
+		return "", err
+	}
+
+	hash := hex.EncodeToString(hasher.Sum(nil))
+	return hash, nil
+}
+
+// fileSHA256 计算文件的 SHA256 哈希值
+func fileSHA256(filePath string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 type writeCounter struct {
@@ -272,5 +305,5 @@ func (wc *writeCounter) Write(p []byte) (int, error) {
 }
 
 func (wc *writeCounter) PrintProgress() {
-	log.Printf("\r[Checker] 下载中... %d MB", wc.Total/1024/1024)
+	fmt.Fprintf(os.Stderr, "\r[Checker] 下载中... %d MB", wc.Total/1024/1024)
 }

@@ -1,8 +1,8 @@
 package handler
 
 import (
-	"blackbox-scanner/internal/model"
-	"blackbox-scanner/internal/store"
+	"vulnscope/internal/model"
+	"vulnscope/internal/store"
 	"net/http"
 	"strconv"
 	"strings"

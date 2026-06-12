@@ -1,10 +1,17 @@
 package store
 
 import (
-	"blackbox-scanner/internal/config"
-	"blackbox-scanner/internal/model"
+	"vulnscope/internal/config"
+	"vulnscope/internal/model"
+	"log"
 	"strings"
+	"time"
 
+	"github.com/knqyf263/go-cpe/common"
+	"github.com/knqyf263/go-cpe/matching"
+	"github.com/knqyf263/go-cpe/naming"
+
+	"github.com/glebarez/sqlite"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -23,6 +30,8 @@ func New(cfg *config.DBConfig) (*Store, error) {
 		db, err = gorm.Open(postgres.Open(cfg.DSN), &gorm.Config{})
 	case "mysql":
 		db, err = gorm.Open(mysql.Open(cfg.DSN), &gorm.Config{})
+	case "sqlite":
+		db, err = gorm.Open(sqlite.Open(cfg.DSN), &gorm.Config{})
 	default:
 		db, err = gorm.Open(mysql.Open(cfg.DSN), &gorm.Config{})
 	}
@@ -30,6 +39,15 @@ func New(cfg *config.DBConfig) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// 配置连接池参数，防止高并发下连接耗尽
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	sqlDB.SetMaxIdleConns(10)           // 空闲连接池最大连接数
+	sqlDB.SetMaxOpenConns(100)          // 数据库最大打开连接数
+	sqlDB.SetConnMaxLifetime(time.Hour) // 连接最大存活时间，避免长时间复用导致的问题
 
 	// 自动迁移
 	if err := db.AutoMigrate(
@@ -175,65 +193,57 @@ func (s *Store) ListAssetsDedup(offset, limit int) ([]model.AssetDedup, int64, e
 	var results []model.AssetDedup
 	var total int64
 
-	// 统计去重后的总数
-	s.DB.Raw(`
-		SELECT COUNT(*) FROM (
-			SELECT COALESCE(NULLIF(ip,''), domain) AS key_val
-			FROM assets
-			WHERE ip != '' OR domain != ''
-			GROUP BY COALESCE(NULLIF(ip,''), domain)
-		) sub
-	`).Scan(&total)
+	// 使用 GORM 子查询构建，避免 Raw SQL 注入风险
+	dedupKey := "COALESCE(NULLIF(ip,''), domain)"
 
-	// 优化查询：使用 LEFT JOIN 替代关联子查询，避免 N+1 问题
-	err := s.DB.Raw(`
-		SELECT 
-			sub.id,
-			sub.ip,
-			sub.domain,
-			sub.alive,
-			sub.status_code,
-			sub.response_time,
-			sub.title,
-			sub.task_count,
-			COALESCE(p.port_count, 0) AS port_count,
-			COALESCE(f.finger_count, 0) AS finger_count
-		FROM (
-			SELECT 
-				MAX(a.id) AS id,
-				COALESCE(NULLIF(a.ip,''), a.domain) AS dedup_key,
-				MAX(a.ip) AS ip,
-				MAX(a.domain) AS domain,
-				MAX(CASE WHEN a.alive THEN 1 ELSE 0 END) AS alive,
-				MAX(a.status_code) AS status_code,
-				MIN(a.response_time) AS response_time,
-				MAX(a.title) AS title,
-				COUNT(DISTINCT a.id) AS task_count
-			FROM assets a
-			WHERE a.ip != '' OR a.domain != ''
-			GROUP BY COALESCE(NULLIF(a.ip,''), a.domain)
-			ORDER BY MAX(a.id) DESC
-			LIMIT ? OFFSET ?
-		) sub
-		LEFT JOIN (
-			SELECT a2.dedup_key, COUNT(DISTINCT p2.id) AS port_count
-			FROM (
-				SELECT COALESCE(NULLIF(ip,''), domain) AS dedup_key, id
-				FROM assets WHERE ip != '' OR domain != ''
-			) a2
-			JOIN ports p2 ON p2.asset_id = a2.id
-			GROUP BY a2.dedup_key
-		) p ON p.dedup_key = sub.dedup_key
-		LEFT JOIN (
-			SELECT a3.dedup_key, COUNT(DISTINCT f2.id) AS finger_count
-			FROM (
-				SELECT COALESCE(NULLIF(ip,''), domain) AS dedup_key, id
-				FROM assets WHERE ip != '' OR domain != ''
-			) a3
-			JOIN fingers f2 ON f2.asset_id = a3.id
-			GROUP BY a3.dedup_key
-		) f ON f.dedup_key = sub.dedup_key
-	`, limit, offset).Scan(&results).Error
+	// 统计去重后的总数
+	countSub := s.DB.Model(&model.Asset{}).
+		Select(dedupKey+" AS key_val").
+		Where("ip != '' OR domain != ''").
+		Group(dedupKey)
+	s.DB.Table("(?) AS sub", countSub).Count(&total)
+
+	// 主查询：使用 GORM 子查询构建
+	// 内层子查询：按 dedup_key 分组聚合
+	innerSub := s.DB.Model(&model.Asset{}).
+		Select(
+			"MAX(id) AS id",
+			dedupKey+" AS dedup_key",
+			"MAX(ip) AS ip",
+			"MAX(domain) AS domain",
+			"MAX(CASE WHEN alive THEN 1 ELSE 0 END) AS alive",
+			"MAX(status_code) AS status_code",
+			"MIN(response_time) AS response_time",
+			"MAX(title) AS title",
+			"COUNT(DISTINCT id) AS task_count",
+		).
+		Where("ip != '' OR domain != ''").
+		Group(dedupKey).
+		Order("MAX(id) DESC").
+		Limit(limit).
+		Offset(offset)
+
+	// 端口计数子查询
+	portSub := s.DB.Table("assets").
+		Select(dedupKey+" AS dedup_key, COUNT(DISTINCT ports.id) AS port_count").
+		Joins("JOIN ports ON ports.asset_id = assets.id").
+		Where("ip != '' OR domain != ''").
+		Group(dedupKey)
+
+	// 指纹计数子查询
+	fingerSub := s.DB.Table("assets").
+		Select(dedupKey+" AS dedup_key, COUNT(DISTINCT fingers.id) AS finger_count").
+		Joins("JOIN fingers ON fingers.asset_id = assets.id").
+		Where("ip != '' OR domain != ''").
+		Group(dedupKey)
+
+	// 组合查询
+	err := s.DB.Table("(?) AS sub", innerSub).
+		Select("sub.id, sub.ip, sub.domain, sub.alive, sub.status_code, sub.response_time, sub.title, sub.task_count, "+
+			"COALESCE(p.port_count, 0) AS port_count, COALESCE(f.finger_count, 0) AS finger_count").
+		Joins("LEFT JOIN (?) AS p ON p.dedup_key = sub.dedup_key", portSub).
+		Joins("LEFT JOIN (?) AS f ON f.dedup_key = sub.dedup_key", fingerSub).
+		Scan(&results).Error
 
 	return results, total, err
 }
@@ -484,14 +494,58 @@ func matchTemplate(tpl model.Template, assetCPE, assetService string) bool {
 	return protocolMatch(tplProtocol, assetService)
 }
 
-// cpeMatch CPE 匹配（简化版：比较 vendor:product 部分）
+// cpeMatch CPE 匹配（使用 go-cpe 库进行正规 WFN 匹配）
+// 支持通配符、版本范围等复杂场景
 func cpeMatch(tplCPE, assetCPE string) bool {
-	// 提取 CPE 的 vendor:product 部分
-	// 格式: cpe:2.3:a:vendor:product:version:...
+	// 尝试解析 CPE 为 WFN 格式
+	// CPE 2.3 格式: cpe:2.3:a:vendor:product:version:...
+	// URI 格式: cpe:/a:vendor:product:version:...
+	tplWFN, err := parseCPE(tplCPE)
+	if err != nil {
+		log.Printf("[CPE] Failed to parse template CPE %q: %v, falling back to string compare", tplCPE, err)
+		return cpeMatchFallback(tplCPE, assetCPE)
+	}
+
+	assetWFN, err := parseCPE(assetCPE)
+	if err != nil {
+		log.Printf("[CPE] Failed to parse asset CPE %q: %v, falling back to string compare", assetCPE, err)
+		return cpeMatchFallback(tplCPE, assetCPE)
+	}
+
+	// 使用 go-cpe 的 IsSuperset/IsSubset/IsEqual 判断匹配关系
+	// IsSuperset: 模板 CPE 的范围是否覆盖资产 CPE（如通配符版本匹配具体版本）
+	if matching.IsSuperset(tplWFN, assetWFN) {
+		return true
+	}
+	// IsSubset: 资产 CPE 的范围是否覆盖模板 CPE
+	if matching.IsSubset(tplWFN, assetWFN) {
+		return true
+	}
+	// IsEqual: 完全相等
+	if matching.IsEqual(tplWFN, assetWFN) {
+		return true
+	}
+
+	return false
+}
+
+// parseCPE 解析 CPE 字符串为 WFN
+func parseCPE(cpeStr string) (common.WellFormedName, error) {
+	// 判断 CPE 格式：2.3 格式以 "cpe:2.3:" 开头，URI 格式以 "cpe:/" 开头
+	if strings.HasPrefix(cpeStr, "cpe:2.3:") {
+		return naming.UnbindFS(cpeStr)
+	} else if strings.HasPrefix(cpeStr, "cpe:/") {
+		return naming.UnbindURI(cpeStr)
+	}
+	// 尝试作为 2.3 格式解析
+	return naming.UnbindFS(cpeStr)
+}
+
+// cpeMatchFallback CPE 匹配降级方案（简单字符串比较）
+func cpeMatchFallback(tplCPE, assetCPE string) bool {
 	tplParts := strings.Split(tplCPE, ":")
 	assetParts := strings.Split(assetCPE, ":")
 
-	// 提取 vendor (index 3) 和 product (index 4)
 	tplVendor := ""
 	tplProduct := ""
 	if len(tplParts) >= 5 {
@@ -510,7 +564,6 @@ func cpeMatch(tplCPE, assetCPE string) bool {
 		return false
 	}
 
-	// vendor 和 product 都匹配
 	return strings.EqualFold(tplVendor, assetVendor) && strings.EqualFold(tplProduct, assetProduct)
 }
 

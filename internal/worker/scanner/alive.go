@@ -1,14 +1,18 @@
 package scanner
 
 import (
-	"blackbox-scanner/internal/config"
+	"vulnscope/internal/config"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,7 +38,7 @@ func AliveScan(ctx context.Context, targets []string, cfg *config.Config) ([]Ali
 	client := &http.Client{
 		Timeout: time.Duration(cfg.Scanner.AliveTimeout) * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.Scanner.InsecureTLS},
 			DialContext: (&net.Dialer{
 				Timeout: 5 * time.Second,
 			}).DialContext,
@@ -109,14 +113,132 @@ func AliveScan(ctx context.Context, targets []string, cfg *config.Config) ([]Ali
 	return results, nil
 }
 
+// icmpSupported 标记当前系统是否支持 raw ICMP（需要管理员/root 权限）
+var icmpSupported = true
+
+// icmpOnce 确保 ICMP 支持检测只执行一次
+var icmpOnce sync.Once
+
 // ping 尝试 ICMP 探测（需要管理员/root 权限）
+// 构造正确的 ICMP Echo Request 包，并在权限不足时自动降级
 func ping(host string) bool {
-	conn, err := net.DialTimeout("ip4:icmp", host, 3*time.Second)
+	// 首次调用时检测 ICMP 是否可用
+	icmpOnce.Do(func() {
+		// 非 Windows 系统检查是否 root，Windows 检查是否管理员
+		if os.Getuid() != 0 && !isWindowsAdmin() {
+			log.Printf("[AliveScan] ICMP: 非 root/管理员权限，ICMP 探测将跳过")
+			icmpSupported = false
+		}
+	})
+
+	if !icmpSupported {
+		return false
+	}
+
+	// 解析主机地址
+	dstIP := net.ParseIP(host)
+	if dstIP == nil {
+		// 尝试 DNS 解析
+		ips, err := net.LookupIP(host)
+		if err != nil || len(ips) == 0 {
+			return false
+		}
+		dstIP = ips[0]
+	}
+
+	// 构造 ICMP Echo Request 包
+	// Type(1) + Code(1) + Checksum(2) + Identifier(2) + Sequence(2) + Data
+	const icmpEchoRequest = 8
+	const icmpCode = 0
+
+	// ICMP 头部 + 时间戳数据
+	type ICMPHeader struct {
+		Type     uint8
+		Code     uint8
+		Checksum uint16
+		ID       uint16
+		Seq      uint16
+	}
+
+	header := ICMPHeader{
+		Type: icmpEchoRequest,
+		Code: icmpCode,
+		ID:   uint16(os.Getpid() & 0xffff),
+		Seq:  1,
+	}
+
+	// 构造完整 ICMP 包（头部 + 8 字节时间戳数据）
+	packet := make([]byte, 8+8)
+	binary.BigEndian.PutUint16(packet[0:2], uint16(header.Type)<<8|uint16(header.Code))
+	binary.BigEndian.PutUint16(packet[4:6], header.ID)
+	binary.BigEndian.PutUint16(packet[6:8], header.Seq)
+
+	// 填充时间戳作为数据
+	now := time.Now().UnixNano()
+	binary.BigEndian.PutUint64(packet[8:16], uint64(now))
+
+	// 计算校验和
+	checksum := calcICMPChecksum(packet)
+	binary.BigEndian.PutUint16(packet[2:4], checksum)
+
+	// 发送 ICMP 包
+	conn, err := net.DialIP("ip4:icmp", nil, &net.IPAddr{IP: dstIP})
+	if err != nil {
+		// 权限不足或系统不支持 raw socket
+		icmpSupported = false
+		return false
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write(packet); err != nil {
+		return false
+	}
+
+	// 读取响应
+	resp := make([]byte, 128)
+	n, err := conn.Read(resp)
 	if err != nil {
 		return false
 	}
-	conn.Close()
-	return true
+
+	// 验证响应是 ICMP Echo Reply (Type = 0)
+	if n < 8 {
+		return false
+	}
+	// IP 头部长度（低4位 * 4）
+	ipHeaderLen := int(resp[0]&0x0f) * 4
+	if n < ipHeaderLen+8 {
+		return false
+	}
+	icmpType := resp[ipHeaderLen]
+	return icmpType == 0 // Echo Reply
+}
+
+// calcICMPChecksum 计算 ICMP 校验和
+func calcICMPChecksum(data []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(data)-1; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(data[i : i+2]))
+	}
+	if len(data)%2 == 1 {
+		sum += uint32(data[len(data)-1]) << 8
+	}
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
+}
+
+// isWindowsAdmin 检测当前进程是否以 Windows 管理员权限运行
+func isWindowsAdmin() bool {
+	// 简单检测：尝试打开 raw socket
+	conn, err := net.DialIP("ip4:icmp", nil, nil)
+	if err == nil {
+		conn.Close()
+		return true
+	}
+	return false
 }
 
 // tcpProbe 尝试常见端口的 TCP 连接探测
@@ -134,20 +256,20 @@ func tcpProbe(host string) bool {
 }
 
 func extractTitle(resp *http.Response) string {
-	// 简单提取 title, 生产环境可用 goquery
 	ct := resp.Header.Get("Content-Type")
 	if !strings.Contains(ct, "text/html") {
 		return ""
 	}
-	buf := make([]byte, 4096)
-	n, _ := resp.Body.Read(buf)
-	if n > 0 {
-		body := string(buf[:n])
-		start := strings.Index(strings.ToLower(body), "<title>")
-		end := strings.Index(strings.ToLower(body), "</title>")
-		if start != -1 && end != -1 && end > start {
-			return body[start+7 : end]
-		}
+	// 限制最大读取 1MB，避免读取超大响应体
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil || len(body) == 0 {
+		return ""
+	}
+	lower := strings.ToLower(string(body))
+	start := strings.Index(lower, "<title>")
+	end := strings.Index(lower, "</title>")
+	if start != -1 && end != -1 && end > start {
+		return string(body[start+7 : end])
 	}
 	return ""
 }

@@ -1,8 +1,8 @@
 package scanner
 
 import (
-	"blackbox-scanner/internal/config"
-	"blackbox-scanner/internal/model"
+	"vulnscope/internal/config"
+	"vulnscope/internal/model"
 	"bufio"
 	"context"
 	"crypto/tls"
@@ -117,6 +117,74 @@ func FingerScan(ctx context.Context, targets []string, cfg *config.Config) (map[
 		}
 	}
 
+	// 第四步：对 HTTP 指纹识别结果不足的目标，使用浏览器渲染获取更多指纹
+	// 浏览器渲染可以执行 JS，检测前端框架全局变量，获取更详细的技术栈信息
+	var browserTargets []string
+	for _, target := range httpTargets {
+		if fr, ok := results[target]; ok {
+			// CPE 和指纹都为空，或只有 WebServer 指纹没有框架/CMS 指纹
+			hasDetailFinger := false
+			for _, f := range fr.Fingers {
+				if f.Category != "WebServer" {
+					hasDetailFinger = true
+					break
+				}
+			}
+			if fr.CPE == "" || !hasDetailFinger {
+				browserTargets = append(browserTargets, target)
+			}
+		}
+	}
+	if len(browserTargets) > 0 && IsBrowserAvailable(cfg) {
+		log.Printf("[FingerScan] Using browser rendering for %d targets with insufficient fingerprints", len(browserTargets))
+		browserResults, err := BrowserFingerScan(ctx, browserTargets, cfg)
+		if err != nil {
+			log.Printf("[FingerScan] Browser finger scan failed: %v", err)
+		} else {
+			for _, br := range browserResults {
+				// 从浏览器结果中提取 host:port
+				host := br.URL
+				if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") {
+					if u, e := parseURL(host); e == nil {
+						host = u
+					}
+				}
+				if existing, ok := results[host]; ok {
+					// 补充浏览器检测到的技术栈指纹
+					for _, tech := range br.Technologies {
+						// 检查是否已有该指纹
+						duplicate := false
+						for _, f := range existing.Fingers {
+							if f.Name == tech {
+								duplicate = true
+								break
+							}
+						}
+						if !duplicate {
+							category := "Frontend"
+							if isCMS(tech) {
+								category = "CMS"
+							} else if isFramework(tech) {
+								category = "Framework"
+							}
+							existing.Fingers = append(existing.Fingers, model.Finger{
+								Name:     tech,
+								Category: category,
+								Detail:   "Browser detected",
+							})
+						}
+					}
+					// 补充 CPE
+					if existing.CPE == "" {
+						existing.CPE = inferCPEFromTechs(br.Technologies)
+					}
+				}
+			}
+		}
+	} else if len(browserTargets) > 0 {
+		log.Printf("[FingerScan] Browser not available, skipping browser-based fingerprinting for %d targets", len(browserTargets))
+	}
+
 	log.Printf("[FingerScan] Finished, found %d results", len(results))
 	return results, nil
 }
@@ -200,11 +268,11 @@ func extractVersion(serverHeader string) string {
 }
 
 // ProbeHTTPService 尝试 HTTP 探测目标是否为 HTTP 服务
-func ProbeHTTPService(ctx context.Context, target string) bool {
+func ProbeHTTPService(ctx context.Context, target string, insecureTLS bool) bool {
 	client := &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS},
 			DialContext: (&net.Dialer{
 				Timeout: 3 * time.Second,
 			}).DialContext,
@@ -542,6 +610,55 @@ func parseURL(rawURL string) (string, error) {
 	return s, nil
 }
 
+// isCMS 判断技术是否为 CMS
+func isCMS(tech string) bool {
+	cmsList := []string{"WordPress", "Drupal", "Joomla"}
+	for _, c := range cmsList {
+		if tech == c {
+			return true
+		}
+	}
+	return false
+}
+
+// isFramework 判断技术是否为 Framework
+func isFramework(tech string) bool {
+	fwList := []string{"React", "Vue", "Angular", "AngularJS", "Next.js", "Nuxt.js", "Svelte", "Ember.js", "Backbone.js", "Meteor", "Laravel", "Django", "Spring"}
+	for _, f := range fwList {
+		if tech == f {
+			return true
+		}
+	}
+	return false
+}
+
+// inferCPEFromTechs 从浏览器检测到的技术栈推断 CPE
+func inferCPEFromTechs(techs []string) string {
+	for _, tech := range techs {
+		switch tech {
+		case "jQuery":
+			return "cpe:2.3:a:jquery:jquery:*:*:*:*:*:*:*:*"
+		case "React":
+			return "cpe:2.3:a:facebook:react:*:*:*:*:*:*:*:*"
+		case "Vue":
+			return "cpe:2.3:a:vuejs:vue:*:*:*:*:*:*:*:*"
+		case "Angular", "AngularJS":
+			return "cpe:2.3:a:angular:angular:*:*:*:*:*:*:*:*"
+		case "WordPress":
+			return "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*"
+		case "Drupal":
+			return "cpe:2.3:a:drupal:drupal:*:*:*:*:*:*:*:*"
+		case "Joomla":
+			return "cpe:2.3:a:joomla:joomla:*:*:*:*:*:*:*:*"
+		case "Bootstrap":
+			return "cpe:2.3:a:getbootstrap:bootstrap:*:*:*:*:*:*:*:*"
+		case "Lodash":
+			return "cpe:2.3:a:lodash:lodash:*:*:*:*:*:*:*:*"
+		}
+	}
+	return ""
+}
+
 // ========== 以下为 HTTP 指纹识别逻辑 ==========
 
 // identifyFingers HTTP 指纹识别：先用 HEAD 探测存活，再用 GET 获取指纹
@@ -559,7 +676,7 @@ func identifyFingers(ctx context.Context, client *http.Client, target string) []
 		client = &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
 				DialContext: (&net.Dialer{
 					Timeout: 5 * time.Second,
 				}).DialContext,

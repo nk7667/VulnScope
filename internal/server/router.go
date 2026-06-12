@@ -1,10 +1,10 @@
 package server
 
 import (
-	"blackbox-scanner/internal/config"
-	"blackbox-scanner/internal/scheduler"
-	"blackbox-scanner/internal/server/handler"
-	"blackbox-scanner/internal/store"
+	"vulnscope/internal/config"
+	"vulnscope/internal/scheduler"
+	"vulnscope/internal/server/handler"
+	"vulnscope/internal/store"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -14,14 +14,17 @@ func SetupRouter(s *store.Store, sched *scheduler.Scheduler, cfg *config.Config)
 	r := gin.Default()
 
 	// CORS — 前端独立部署，跨域访问 API
+	// 必须显式配置 allowed_origins，不允许默认 * 防止跨域滥用
 	allowedOrigins := cfg.Server.AllowedOrigins
 	if allowedOrigins == "" {
-		allowedOrigins = "*"
+		allowedOrigins = "" // 不设置则不返回 CORS 头，浏览器默认同源策略
 	}
 	r.Use(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", allowedOrigins)
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+		if allowedOrigins != "" {
+			c.Header("Access-Control-Allow-Origin", allowedOrigins)
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+		}
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
@@ -32,11 +35,8 @@ func SetupRouter(s *store.Store, sched *scheduler.Scheduler, cfg *config.Config)
 	// API Key 认证中间件
 	if cfg.Server.APIKey != "" {
 		r.Use(func(c *gin.Context) {
-			// 从 Header 或 Query 参数获取 API Key
+			// 仅从 Header 获取 API Key，避免 Query 参数泄露到日志/Referer
 			key := c.GetHeader("X-API-Key")
-			if key == "" {
-				key = c.Query("api_key")
-			}
 			if key != cfg.Server.APIKey {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "无效的 API Key"})
 				return
@@ -62,6 +62,9 @@ func SetupRouter(s *store.Store, sched *scheduler.Scheduler, cfg *config.Config)
 		api.GET("/tasks/:id", taskH.Get)
 		api.DELETE("/tasks/:id", taskH.Delete)
 		api.GET("/tasks/:id/logs", taskH.GetLogs)
+		api.POST("/tasks/:id/cancel", taskH.Cancel)
+		api.POST("/tasks/:id/pause", taskH.Pause)
+		api.POST("/tasks/:id/resume", taskH.Resume)
 
 		// 资产管理
 		assetH := handler.NewAssetHandler(s)

@@ -1,9 +1,9 @@
 package handler
 
 import (
-	"blackbox-scanner/internal/model"
-	"blackbox-scanner/internal/scheduler"
-	"blackbox-scanner/internal/store"
+	"vulnscope/internal/model"
+	"vulnscope/internal/scheduler"
+	"vulnscope/internal/store"
 	"net/http"
 	"strconv"
 
@@ -93,6 +93,36 @@ func (h *TaskHandler) Delete(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "deleted"})
+}
+
+// Cancel 取消任务
+func (h *TaskHandler) Cancel(c *gin.Context) {
+	id, _ := strconv.Atoi(c.Param("id"))
+	if err := h.scheduler.CancelTask(uint(id)); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "cancelled"})
+}
+
+// Pause 暂停任务
+func (h *TaskHandler) Pause(c *gin.Context) {
+	id, _ := strconv.Atoi(c.Param("id"))
+	if err := h.scheduler.PauseTask(uint(id)); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "paused"})
+}
+
+// Resume 恢复任务
+func (h *TaskHandler) Resume(c *gin.Context) {
+	id, _ := strconv.Atoi(c.Param("id"))
+	if err := h.scheduler.ResumeTask(uint(id)); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "resumed"})
 }
 
 func (h *TaskHandler) GetLogs(c *gin.Context) {

@@ -1,7 +1,7 @@
 package handler
 
 import (
-	"blackbox-scanner/internal/store"
+	"vulnscope/internal/store"
 	"net/http"
 	"strconv"
 

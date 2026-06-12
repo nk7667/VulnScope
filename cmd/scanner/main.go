@@ -1,18 +1,20 @@
 package main
 
 import (
-	"blackbox-scanner/internal/checker"
-	"blackbox-scanner/internal/config"
-	"blackbox-scanner/internal/scheduler"
-	"blackbox-scanner/internal/server"
-	"blackbox-scanner/internal/store"
-	worker "blackbox-scanner/internal/worker"
+	"vulnscope/internal/checker"
+	"vulnscope/internal/config"
+	"vulnscope/internal/model"
+	"vulnscope/internal/scheduler"
+	"vulnscope/internal/server"
+	"vulnscope/internal/store"
+	worker "vulnscope/internal/worker"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -36,7 +38,6 @@ func main() {
 	log.Printf("  模式: %s", cfg.Mode)
 	log.Printf("  API:  %s", cfg.Server.Addr)
 	log.Printf("  Redis: %s", cfg.Redis.Addr)
-	log.Printf("  DB:   %s", cfg.Database.DSN)
 	log.Printf("========================================")
 
 	// 前置检查：nmap / nuclei 可用性
@@ -69,15 +70,25 @@ func main() {
 		log.Fatalf("无效的运行模式: %s (可选: server / worker / all)", cfg.Mode)
 	}
 
-	// Scheduler 只在 server 模式下需要（用于 API 创建任务时入队）
+	// Scheduler 统一管理入队（唯一 asynq.Client 入口）
 	var sched *scheduler.Scheduler
 	if startServer {
 		sched = scheduler.New(&cfg.Redis, s, cfg)
 	}
 
-	// 启动 Worker（Worker 自己持有 asynq.Client，不依赖 Scheduler）
+	// 启动 Worker（通过 Scheduler 回调入队，不再持有 asynq.Client）
+	var w *worker.Worker
 	if startWorker {
-		w := worker.New(&cfg.Redis, s, cfg)
+		// 使用 Scheduler 的入队方法作为回调
+		var enqueueFn worker.EnqueueFunc
+		if sched != nil {
+			enqueueFn = sched.EnqueueNextStage
+		} else {
+			// Worker-only 模式：创建独立的 Scheduler 仅用于入队
+			enqueueSched := scheduler.New(&cfg.Redis, s, cfg)
+			enqueueFn = enqueueSched.EnqueueNextStage
+		}
+		w = worker.New(&cfg.Redis, s, cfg, enqueueFn)
 		go func() {
 			if err := w.Run(); err != nil {
 				log.Fatalf("Worker 启动失败: %v", err)
@@ -95,6 +106,9 @@ func main() {
 			}
 		}()
 		log.Printf("[Main] API Server 已启动, 监听 %s", cfg.Server.Addr)
+
+		// 节点状态同步：定期将节点状态写入数据库
+		go syncNodeStatus(s, cfg)
 	}
 
 	// 等待退出信号
@@ -102,9 +116,40 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
 	fmt.Println()
-	log.Printf("[Main] 收到信号 %v, 正在关闭...", sig)
+	log.Printf("[Main] 收到信号 %v, 正在优雅关闭...", sig)
+
+	// 优雅关闭 Worker：等待正在处理的任务完成
+	if w != nil {
+		log.Println("[Main] 正在关闭 Worker，等待正在处理的任务完成...")
+		w.Shutdown()
+		log.Println("[Main] Worker 已关闭")
+	}
+
+	// 关闭 Scheduler 的 asynq.Client
 	if sched != nil {
 		sched.Close()
 	}
+
 	log.Println("[Main] 已关闭")
+}
+
+// syncNodeStatus 定期同步节点状态到数据库
+func syncNodeStatus(s *store.Store, cfg *config.Config) {
+	hostname, _ := os.Hostname()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		var nodeCfg model.Config
+		key := fmt.Sprintf("node:%s:status", hostname)
+		if err := s.DB.Where("`key` = ?", key).First(&nodeCfg).Error; err != nil {
+			s.DB.Create(&model.Config{
+				Key:   key,
+				Value: fmt.Sprintf("alive:%s", time.Now().Format(time.RFC3339)),
+			})
+		} else {
+			nodeCfg.Value = fmt.Sprintf("alive:%s", time.Now().Format(time.RFC3339))
+			s.DB.Save(&nodeCfg)
+		}
+	}
 }
