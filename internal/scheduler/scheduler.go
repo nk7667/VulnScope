@@ -241,38 +241,10 @@ func (s *Scheduler) EnqueueNextStage(currentStage string, taskID uint, targets [
 	return s.store.UpdateTask(task)
 }
 
-// EnqueueNextStageBatch 按批次入队下一阶段（用于 domain 阶段，所有目标一起处理）
+// EnqueueNextStageBatch 按批次入队下一阶段
+// domain 阶段结果按单目标粒度入队 alive，与 EnqueueNextStage 逻辑一致
 func (s *Scheduler) EnqueueNextStageBatch(currentStage string, taskID uint, targets []string) error {
-	var nextType string
-	var nextProgress string
-	switch currentStage {
-	case "domain":
-		nextType = TypeAliveScan
-		nextProgress = "alive"
-	default:
-		return s.EnqueueNextStage(currentStage, taskID, targets)
-	}
-
-	// domain 阶段结果按单个目标粒度入队 alive
-	for _, target := range targets {
-		payload := ScanPayload{
-			TaskID:  taskID,
-			Targets: []string{target},
-		}
-		if err := s.enqueue(nextType, payload, 3); err != nil {
-			log.Printf("[Scheduler] Failed to enqueue %s for target %s: %v", nextType, target, err)
-			continue
-		}
-	}
-
-	log.Printf("[Scheduler] Enqueued %d targets for stage %s, task_id=%d", len(targets), nextType, taskID)
-
-	task, err := s.store.GetTask(taskID)
-	if err != nil {
-		return err
-	}
-	task.Progress = nextProgress
-	return s.store.UpdateTask(task)
+	return s.EnqueueNextStage(currentStage, taskID, targets)
 }
 
 // CancelTask 取消任务：删除队列中待执行的任务，标记任务状态为 cancelled
@@ -423,7 +395,9 @@ func (s *Scheduler) enqueue(taskType string, payload ScanPayload, priority int) 
 	}
 
 	// 不在允许的扫描时间段内，设置延迟执行到下一个时间窗口
+	delayed := false
 	if !s.IsAllowedScanTime() {
+		delayed = true
 		delay := s.nextScanWindowDelay()
 		opts = append(opts, asynq.ProcessIn(delay))
 		log.Printf("[Scheduler] 当前不在扫描时间段（%s-%s），任务将在 %v 后执行, task_id=%d",
@@ -435,6 +409,13 @@ func (s *Scheduler) enqueue(taskType string, payload ScanPayload, priority int) 
 	if err != nil {
 		return err
 	}
+
+	if delayed {
+		s.logTask(payload.TaskID, "system", "info",
+			fmt.Sprintf("任务已入队但延迟执行，等待扫描时间窗口（%s-%s），预计 %v 后开始",
+				s.cfg.Worker.AllowScanStart, s.cfg.Worker.AllowScanEnd, s.nextScanWindowDelay()))
+	}
+
 	log.Printf("[Scheduler] Enqueued %s, task_id=%d, asynq_id=%s, queue=%s", taskType, payload.TaskID, info.ID, queueName)
 	return nil
 }

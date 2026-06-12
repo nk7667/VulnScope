@@ -114,6 +114,8 @@ func VulnScanWithTemplates(ctx context.Context, targets []string, templatePaths 
 	}
 
 	// 设置扫描超时
+	// 注意：-scan-timeout 是 nuclei v2.9.8+ 才支持的 flag，旧版本会报错
+	// 先尝试带 -scan-timeout 运行，如果 stderr 包含 unknown flag 则自动回退
 	scanTimeout := 30 * time.Minute
 	if deadline, ok := ctx.Deadline(); ok {
 		scanTimeout = time.Until(deadline)
@@ -135,7 +137,7 @@ func VulnScanWithTemplates(ctx context.Context, targets []string, templatePaths 
 		return nil, fmt.Errorf("nuclei stdout pipe 失败: %v", err)
 	}
 
-	// stderr 用于错误日志
+	// stderr 用于错误日志和兼容性检测
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return nil, fmt.Errorf("nuclei stderr pipe 失败: %v", err)
@@ -145,11 +147,13 @@ func VulnScanWithTemplates(ctx context.Context, targets []string, templatePaths 
 		return nil, fmt.Errorf("nuclei 启动失败: %v", err)
 	}
 
-	// 流式读取 stderr（非阻塞）
+	// 流式读取 stderr，检测 unknown flag 错误
+	var stderrBuf strings.Builder
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
+			stderrBuf.WriteString(line + "\n")
 			if strings.Contains(line, "error") || strings.Contains(line, "fatal") {
 				log.Printf("[VulnScan] nuclei stderr: %s", line)
 			}
@@ -212,8 +216,119 @@ func VulnScanWithTemplates(ctx context.Context, targets []string, templatePaths 
 			log.Printf("[VulnScan] nuclei scan cancelled by context")
 			return vulns, nil
 		}
+
+		// 检测 -scan-timeout 不支持的旧版本 nuclei，自动移除后重试
+		stderrStr := stderrBuf.String()
+		if strings.Contains(stderrStr, "scan-timeout") &&
+			(strings.Contains(stderrStr, "unknown") || strings.Contains(stderrStr, "unknown flag") || strings.Contains(stderrStr, "not defined")) {
+			log.Printf("[VulnScan] nuclei 不支持 -scan-timeout flag，移除后重试")
+			// 移除 -scan-timeout 参数
+			filteredArgs := make([]string, 0, len(args))
+			skipNext := false
+			for _, a := range args {
+				if a == "-scan-timeout" {
+					skipNext = true
+					continue
+				}
+				if skipNext {
+					skipNext = false
+					continue
+				}
+				filteredArgs = append(filteredArgs, a)
+			}
+			return runNucleiCmd(ctx, nucleiPath, filteredArgs)
+		}
+
 		// nuclei 退出码 1 可能表示有发现但无致命错误，只记录警告
 		log.Printf("[VulnScan] nuclei exited with error: %v (found %d vulns before exit)", err, len(vulns))
+	}
+
+	log.Printf("[VulnScan] nuclei finished, found %d vulnerabilities", len(vulns))
+	return vulns, nil
+}
+
+// runNucleiCmd 执行 nuclei 命令并解析输出（用于兼容性重试）
+func runNucleiCmd(ctx context.Context, nucleiPath string, args []string) ([]model.Vuln, error) {
+	log.Printf("[VulnScan] Retrying nuclei: %s %v", nucleiPath, args)
+
+	cmd := exec.CommandContext(ctx, nucleiPath, args...)
+	cmd.Env = append(os.Environ(), "NUCLEI_LOG_LEVEL=error")
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("nuclei stdout pipe 失败: %v", err)
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("nuclei stderr pipe 失败: %v", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("nuclei 启动失败: %v", err)
+	}
+
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, "error") || strings.Contains(line, "fatal") {
+				log.Printf("[VulnScan] nuclei stderr: %s", line)
+			}
+		}
+	}()
+
+	var vulns []model.Vuln
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		var result nucleiJSONResult
+		if err := json.Unmarshal([]byte(line), &result); err != nil {
+			continue
+		}
+
+		templateName := result.Info.Name
+		severity := result.Info.Severity
+		if templateName == "" && result.TemplateID == "" {
+			continue
+		}
+
+		name := templateName
+		if name == "" {
+			name = result.TemplateID
+		}
+
+		matchedURL := firstNonEmpty(result.Matched, result.Host)
+		evidence := ""
+		if len(result.ExtractedResults) > 0 {
+			evidence = strings.Join(result.ExtractedResults, ", ")
+		}
+
+		vuln := model.Vuln{
+			Name:        name,
+			Severity:    severity,
+			Type:        result.Type,
+			TemplateID:  result.TemplateID,
+			URL:         matchedURL,
+			Request:     result.Request,
+			Response:    result.Response,
+			Evidence:    evidence,
+			Remediation: result.Info.Remediation,
+			Status:      0,
+		}
+		vulns = append(vulns, vuln)
+		log.Printf("[VulnScan] Found vuln: %s [%s] %s", vuln.Name, vuln.Severity, vuln.URL)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return vulns, nil
+		}
+		log.Printf("[VulnScan] nuclei exited with error: %v (found %d vulns)", err, len(vulns))
 	}
 
 	log.Printf("[VulnScan] nuclei finished, found %d vulnerabilities", len(vulns))
