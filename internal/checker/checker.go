@@ -3,6 +3,7 @@ package checker
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -101,15 +102,23 @@ func DownloadNuclei() (string, error) {
 	// 确定 GitHub release 下载 URL
 	goos := runtime.GOOS
 	arch := runtime.GOARCH
-	if runtime.GOARCH == "amd64" {
-		arch = "amd64"
-	} else {
-		arch = "386"
-	}
+	// nuclei v3 release 文件名格式: nuclei_{version}_{goos}_{arch}.zip
+	// 需要先查询最新版本号
 
-	// nuclei 最新版本 URL
-	zipName := fmt.Sprintf("nuclei_%s_%s.zip", goos, arch)
-	url := fmt.Sprintf("https://github.com/projectdiscovery/nuclei/releases/latest/download/%s", zipName)
+	// 直接使用 GOARCH，nuclei 支持 amd64/arm64/386
+	// 不做映射，保持原值
+
+	// 查询最新版本号
+	version, err := getLatestNucleiVersion()
+	if err != nil {
+		return "", fmt.Errorf("查询 nuclei 最新版本失败: %v\n请手动下载: https://github.com/projectdiscovery/nuclei/releases", err)
+	}
+	log.Printf("[Checker] nuclei 最新版本: %s\n", version)
+
+	// nuclei v3 的 release 文件名格式: nuclei_{version}_{goos}_{arch}.zip
+	// 例如: nuclei_3.8.0_linux_amd64.zip
+	zipName := fmt.Sprintf("nuclei_%s_%s_%s.zip", version, goos, arch)
+	url := fmt.Sprintf("https://github.com/projectdiscovery/nuclei/releases/download/v%s/%s", version, zipName)
 
 	log.Printf("[Checker] 正在下载 nuclei: %s\n", url)
 
@@ -251,6 +260,31 @@ func CheckAndInstall(nmapPath, nucleiPath string) (string, string, []string) {
 	}
 
 	return nmapPath, nucleiPath, warnings
+}
+
+// getLatestNucleiVersion 通过 GitHub API 查询 nuclei 最新版本号
+func getLatestNucleiVersion() (string, error) {
+	url := "https://api.github.com/repos/projectdiscovery/nuclei/releases/latest"
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("请求 GitHub API 失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GitHub API 返回状态码: %d", resp.StatusCode)
+	}
+
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return "", fmt.Errorf("解析 GitHub API 响应失败: %v", err)
+	}
+
+	// tag_name 格式为 "v3.8.0"，去掉 "v" 前缀
+	version := strings.TrimPrefix(release.TagName, "v")
+	return version, nil
 }
 
 func downloadFile(url, filePath string) (string, error) {

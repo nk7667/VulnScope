@@ -543,11 +543,8 @@ func (w *Worker) doFingerScan(ctx context.Context, t *asynq.Task) error {
 		return nil
 	}
 
-	// 幂等检查
-	if w.isStageCompleted(p.TaskID, "finger") {
-		log.Printf("[Worker] Finger scan already completed for task_id=%d, skipping", p.TaskID)
-		return nil
-	}
+	// 注意：指纹扫描按目标分批入队，不做 isStageCompleted 检查
+	// 否则第一个目标完成后会标记整个 finger 阶段完成，后续目标被跳过
 
 	w.logTask(p.TaskID, "finger", "info", fmt.Sprintf("开始指纹识别，目标数: %d", len(p.Targets)))
 
@@ -665,11 +662,8 @@ func (w *Worker) doVulnScan(ctx context.Context, t *asynq.Task) error {
 		return nil
 	}
 
-	// 幂等检查
-	if w.isStageCompleted(p.TaskID, "vuln") {
-		log.Printf("[Worker] Vuln scan already completed for task_id=%d, skipping", p.TaskID)
-		return nil
-	}
+	// 注意：漏洞扫描按目标分批入队，不做 isStageCompleted 检查
+	// 否则第一个目标完成后会标记整个 vuln 阶段完成，后续目标被跳过
 
 	w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("开始漏洞扫描，目标数: %d", len(p.Targets)))
 
@@ -768,7 +762,6 @@ func (w *Worker) doVulnScan(ctx context.Context, t *asynq.Task) error {
 	}
 
 	w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("漏洞扫描完成，发现 %d 个漏洞", len(vulns)))
-	w.markStageCompleted(p.TaskID, "vuln")
 	for _, v := range vulns {
 		w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("- %s [%s] %s", v.Name, v.Severity, v.URL))
 	}
@@ -853,7 +846,6 @@ func (w *Worker) handleRetestScan(ctx context.Context, p scheduler.ScanPayload) 
 	}
 
 	w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("复测扫描完成，发现 %d 个漏洞", len(vulns)))
-	w.markStageCompleted(p.TaskID, "vuln")
 
 	for _, v := range vulns {
 		v.TaskID = p.TaskID
