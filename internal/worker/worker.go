@@ -901,18 +901,14 @@ func (w *Worker) handleRetestScan(ctx context.Context, p scheduler.ScanPayload) 
 		w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("- [复测] %s [%s] %s", v.Name, v.Severity, v.URL))
 	}
 
-	// 更新原漏洞的验证时间和状态
+	// 只更新复测时间，不自动改 status（误报判定由人工通过 PUT /vulns/:id/status 完成）
 	now := time.Now()
 	for _, orig := range originalVulns {
 		orig.VerifiedAt = &now
 		if len(vulns) == 0 {
-			// 复测未发现漏洞，原漏洞确认为误报
-			orig.Status = 1
-			w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("复测确认误报: %s", orig.Name))
+			w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("复测未复现: %s（待人工确认是否误报）", orig.Name))
 		} else {
-			// 复测发现漏洞，原漏洞确认为真实漏洞
-			orig.Status = 2
-			w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("复测确认真实漏洞: %s", orig.Name))
+			w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("复测复现: %s（可复现）", orig.Name))
 		}
 		w.store.UpdateVuln(&orig)
 	}
