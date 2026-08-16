@@ -12,6 +12,8 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -742,6 +744,12 @@ func (w *Worker) doVulnScan(ctx context.Context, t *asynq.Task) error {
 	log.Printf("[Worker] Vuln scan validTargets: %v", validTargets)
 
 	totalMatched := 0
+	matchedTemplatePaths := make(map[string]bool) // 去重
+	templateDir := w.cfg.Scanner.NucleiTemplates
+	if templateDir == "" {
+		homeDir, _ := os.UserHomeDir()
+		templateDir = filepath.Join(homeDir, "nuclei-templates")
+	}
 	for _, info := range targetInfos {
 		matched, err := w.store.GetMatchedVulnTemplates(info.CPE, info.Service)
 		if err != nil {
@@ -750,10 +758,33 @@ func (w *Worker) doVulnScan(ctx context.Context, t *asynq.Task) error {
 		}
 		totalMatched += len(matched)
 		log.Printf("[Worker] Target %s (CPE=%s, Service=%s) matched %d vuln templates", info.Target, info.CPE, info.Service, len(matched))
+		for _, tpl := range matched {
+			if tpl.FilePath != "" {
+				fullPath := filepath.Join(templateDir, tpl.FilePath)
+				matchedTemplatePaths[fullPath] = true
+			}
+		}
 	}
 
-	w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("模板匹配 %d 个，按服务协议筛选漏洞模板目录进行扫描", totalMatched))
-	vulns, scanErr := scanner.VulnScanByService(ctx, validTargets, targetInfos, w.cfg)
+	var vulns []model.Vuln
+	var scanErr error
+	if len(matchedTemplatePaths) > 0 && len(matchedTemplatePaths) <= 50 {
+		// CPE 驱动：只扫匹配到的具体模板（上限 50 个，避免 nuclei 命令行参数溢出）
+		paths := make([]string, 0, len(matchedTemplatePaths))
+		for p := range matchedTemplatePaths {
+			paths = append(paths, p)
+		}
+		w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("CPE 驱动扫描：匹配 %d 个模板，精准扫描", len(paths)))
+		vulns, scanErr = scanner.VulnScanWithTemplates(ctx, validTargets, paths, w.cfg)
+	} else {
+		// 兜底：无 CPE 匹配或模板过多（>50），按服务协议选目录广撒网
+		reason := "无 CPE 匹配模板"
+		if len(matchedTemplatePaths) > 50 {
+			reason = fmt.Sprintf("匹配模板 %d 个过多，回退目录扫描", len(matchedTemplatePaths))
+		}
+		w.logTask(p.TaskID, "vuln", "info", reason+"，按服务协议筛选漏洞模板目录进行扫描")
+		vulns, scanErr = scanner.VulnScanByService(ctx, validTargets, targetInfos, w.cfg)
+	}
 
 	if scanErr != nil {
 		w.logTask(p.TaskID, "vuln", "error", fmt.Sprintf("漏洞扫描失败: %v", scanErr))
@@ -770,6 +801,11 @@ func (w *Worker) doVulnScan(ctx context.Context, t *asynq.Task) error {
 		v.TaskID = p.TaskID
 		v.AssetID = resolveAssetID(w.store, p.TaskID, v.URL)
 		w.store.CreateVuln(&v)
+	}
+
+	// 漏洞扫描完成后，自动学习：禁用高误报率模板
+	if disabled, err := w.store.DisableHighFalsePositiveTemplates(0.8, 5); err == nil && disabled > 0 {
+		w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("自动学习：已禁用 %d 个高误报率模板", disabled))
 	}
 
 	// vuln 是最后阶段，通过 enqueue 触发任务完成
@@ -847,11 +883,38 @@ func (w *Worker) handleRetestScan(ctx context.Context, p scheduler.ScanPayload) 
 
 	w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("复测扫描完成，发现 %d 个漏洞", len(vulns)))
 
+	// 查找原漏洞（通过 RetestTaskID 关联）
+	var originalVulns []model.Vuln
+	w.store.DB.Where("retest_task_id = ?", p.TaskID).Find(&originalVulns)
+
 	for _, v := range vulns {
 		v.TaskID = p.TaskID
 		v.AssetID = resolveAssetID(w.store, p.TaskID, v.URL)
+		// 关联原漏洞
+		for _, orig := range originalVulns {
+			if orig.TemplateID == v.TemplateID || orig.URL == v.URL {
+				v.RetestVulnID = orig.ID
+				break
+			}
+		}
 		w.store.CreateVuln(&v)
 		w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("- [复测] %s [%s] %s", v.Name, v.Severity, v.URL))
+	}
+
+	// 更新原漏洞的验证时间和状态
+	now := time.Now()
+	for _, orig := range originalVulns {
+		orig.VerifiedAt = &now
+		if len(vulns) == 0 {
+			// 复测未发现漏洞，原漏洞确认为误报
+			orig.Status = 1
+			w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("复测确认误报: %s", orig.Name))
+		} else {
+			// 复测发现漏洞，原漏洞确认为真实漏洞
+			orig.Status = 2
+			w.logTask(p.TaskID, "vuln", "info", fmt.Sprintf("复测确认真实漏洞: %s", orig.Name))
+		}
+		w.store.UpdateVuln(&orig)
 	}
 
 	// 复测任务完成
